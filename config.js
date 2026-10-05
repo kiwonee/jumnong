@@ -9,7 +9,7 @@ window.APP_CONFIG = {
 
   // 앱 화면 안에 표시되는 이름
   // (홈 화면 아이콘 아래 이름은 manifest.json의 name, short_name에서 바꿔요)
-  CLUB_NAME: '우리 농구단',
+  CLUB_NAME: '점농회',
 
   // 관리자 추가 등록용 코드 (원하는 값으로 바꾸세요)
   ADMIN_CODE: 'kiwoneee',
