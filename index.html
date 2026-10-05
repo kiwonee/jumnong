@@ -176,43 +176,251 @@ async function verifyPassword(pw, player) {
   }
 }
 
-function winRate(p) {
-  const total = (p?.wins || 0) + (p?.losses || 0);
-  return total === 0 ? 0.5 : p.wins / total;
+// ============================================================
+// 점수 계산
+// - 팀 배정: Rating(엘로 점수) + 키 + 포지션 (아래 '팀 배정' 부분 참고)
+// - Rating 랭킹: 엘로 점수, 20경기 이상만 순위에 포함
+// - 승률 랭킹: 윌슨 점수, 20경기 이상만 순위에 포함
+// - 적중률 랭킹: 윌슨 점수 (95% 신뢰구간 하한, 판수가 적을수록 낮게 매김)
+// 승률과 적중률은 서로 섞지 않고 따로 계산해요.
+// ============================================================
+const RANKING_MIN_GAMES = 20; // 승률 랭킹, Rating 랭킹에 들어가기 위한 최소 경기 수
+
+function gamesPlayed(p) {
+  return (p?.wins || 0) + (p?.losses || 0);
+}
+
+function wilsonScore(success, total) {
+  if (!total) return 0;
+  const z = 1.96;
+  const z2 = z * z;
+  const p = success / total;
+  const center = p + z2 / (2 * total);
+  const margin = z * Math.sqrt((p * (1 - p)) / total + z2 / (4 * total * total));
+  return (center - margin) / (1 + z2 / total);
+}
+
+// 승부예측 기록: 예측한 횟수와 맞힌 횟수
+function predictionStats(p) {
+  const history = p?.history || [];
+  const total = history.filter((h) => h.predicted).length;
+  const correct = history.filter((h) => h.predicted && h.predictionCorrect).length;
+  return { correct, total };
+}
+
+function pct(success, total) {
+  return total ? `${Math.round((success / total) * 100)}%` : '-';
 }
 
 function winRatePct(p) {
-  const total = (p?.wins || 0) + (p?.losses || 0);
-  if (total === 0) return '-';
-  return `${Math.round((p.wins / total) * 100)}%`;
+  return pct(p?.wins || 0, gamesPlayed(p));
+}
+
+// ============================================================
+// Rating (엘로 점수)
+// 경기 전 두 팀의 예상 승리 확률을 계산하고, 예상보다 잘하면 오르고 못하면 내려가요.
+// ============================================================
+const ELO_BASE = 1500;     // 처음 시작 점수
+const ELO_K_NEW = 40;      // 경기 수가 적은 사람은 점수가 빨리 자리 잡도록 크게 움직임
+const ELO_K = 24;          // 경기를 어느 정도 한 사람
+const ELO_NEW_GAMES = 10;  // 이 경기 수 미만이면 '새로 온 사람'으로 봄
+
+function eloOf(p) {
+  return typeof p?.elo === 'number' ? p.elo : ELO_BASE;
+}
+
+function teamAverageElo(ids, playerMap) {
+  const list = ids.map((id) => playerMap[id]).filter(Boolean);
+  if (!list.length) return ELO_BASE;
+  return list.reduce((sum, p) => sum + eloOf(p), 0) / list.length;
+}
+
+// A팀이 이길 예상 확률
+function expectedWinA(eloA, eloB) {
+  return 1 / (1 + Math.pow(10, (eloB - eloA) / 400));
+}
+
+// ============================================================
+// 팀 배정
+// 1) 무조건 지킬 규칙을 어기면 큰 벌점
+// 2) 리바운드 > 포지션 구성 > 실력 > 평균 키 순으로 두 팀의 차이를 점수화
+// 3) 가능한 조합을 전부 계산해서 가장 공평한 조합들 중 하나를 무작위로 선택
+// ============================================================
+const POSITION_HEIGHT_BONUS = { '가드': 0, '포워드': 3, '센터': 6 }; // 리바운드용 유효 키 보정(cm)
+const TEAM_WEIGHTS = { rebound: 4, position: 3, skill: 2, height: 1 };
+const MIN_HEIGHT = 140;
+const MAX_HEIGHT = 220;
+const DEFAULT_HEIGHT = 175;
+const MAX_EXHAUSTIVE_PLAYERS = 22; // 이 인원까지는 모든 조합을 다 계산
+const HARD_PENALTY = 1000;
+
+function validHeight(h) {
+  const n = Number(h);
+  return n >= MIN_HEIGHT && n <= MAX_HEIGHT ? n : null;
+}
+
+function stdDev(values, floor) {
+  if (values.length < 2) return floor;
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const variance = values.reduce((a, b) => a + (b - mean) * (b - mean), 0) / values.length;
+  return Math.max(Math.sqrt(variance), floor);
 }
 
 function generateTeams(attendeePlayers) {
-  const byPos = {};
-  POSITIONS.forEach((pos) => { byPos[pos] = []; });
-  const fallback = POSITIONS[1];
-  attendeePlayers.forEach((p) => {
-    const pos = POSITIONS.includes(p.position) ? p.position : fallback;
-    byPos[pos].push(p);
-  });
+  const n = attendeePlayers.length;
+  if (n < 2) return { A: attendeePlayers.map((p) => p.id), B: [] };
 
-  let teamA = [];
-  let teamB = [];
-  let aStarts = true;
+  // 키를 입력하지 않은 사람은 오늘 참석자 평균 키로 계산
+  const known = attendeePlayers.map((p) => validHeight(p.height)).filter((h) => h !== null);
+  const fallbackHeight = known.length ? known.reduce((a, b) => a + b, 0) / known.length : DEFAULT_HEIGHT;
 
-  POSITIONS.forEach((pos) => {
-    const sorted = [...byPos[pos]].sort((x, y) => winRate(y) - winRate(x));
-    sorted.forEach((p, idx) => {
-      const toA = aStarts ? idx % 2 === 0 : idx % 2 === 1;
-      if (toA) teamA.push(p); else teamB.push(p);
-    });
-    aStarts = !aStarts;
-  });
+  const pos = attendeePlayers.map((p) => (POSITIONS.includes(p.position) ? p.position : '포워드'));
+  const height = attendeePlayers.map((p) => validHeight(p.height) ?? fallbackHeight);
+  const eff = height.map((h, i) => h + (POSITION_HEIGHT_BONUS[pos[i]] || 0));
+  const elo = attendeePlayers.map(eloOf);
+  const isC = pos.map((p) => (p === '센터' ? 1 : 0));
+  const isF = pos.map((p) => (p === '포워드' ? 1 : 0));
+  const isG = pos.map((p) => (p === '가드' ? 1 : 0));
+  const totalC = isC.reduce((a, b) => a + b, 0);
+  const totalG = isG.reduce((a, b) => a + b, 0);
 
-  while (teamA.length - teamB.length > 1) { teamB.push(teamA.pop()); }
-  while (teamB.length - teamA.length > 1) { teamA.push(teamB.pop()); }
+  // 단위가 다른 값을 같은 눈금으로 맞추기 위한 기준 (오늘 참석자들 사이의 표준편차)
+  const sdEff = stdDev(eff, 3);
+  const sdHeight = stdDev(height, 3);
+  const sdElo = stdDev(elo, 50);
 
-  return { A: teamA.map((p) => p.id), B: teamB.map((p) => p.id) };
+  const sizeA = Math.floor(n / 2);
+  const inA = new Uint8Array(n);
+
+  function cost() {
+    let nA = 0, nB = 0, eloA = 0, eloB = 0, hA = 0, hB = 0;
+    let cA = 0, cB = 0, fA = 0, fB = 0, gA = 0, gB = 0;
+    let a1 = -Infinity, a2 = -Infinity, b1 = -Infinity, b2 = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const v = eff[i];
+      if (inA[i]) {
+        nA++; eloA += elo[i]; hA += height[i]; cA += isC[i]; fA += isF[i]; gA += isG[i];
+        if (v > a1) { a2 = a1; a1 = v; } else if (v > a2) { a2 = v; }
+      } else {
+        nB++; eloB += elo[i]; hB += height[i]; cB += isC[i]; fB += isF[i]; gB += isG[i];
+        if (v > b1) { b2 = b1; b1 = v; } else if (v > b2) { b2 = v; }
+      }
+    }
+
+    // 1) 무조건 지킬 규칙
+    let penalty = 0;
+    if (totalC >= 2 && (cA === 0 || cB === 0)) penalty += HARD_PENALTY;       // 센터 2명 이상이면 팀마다 1명 이상
+    if (Math.abs((cA + fA) - (cB + fB)) > 1) penalty += HARD_PENALTY;         // 빅맨 수 차이 1명 이하
+    if (totalG >= 2 && (gA === 0 || gB === 0)) penalty += HARD_PENALTY;       // 가드 2명 이상이면 팀마다 1명 이상
+
+    // 2) 리바운드: 팀에서 가장 큰 빅맨끼리, 두 번째 빅맨끼리 비교 (첫 번째가 더 중요)
+    const d1 = (a1 - b1) / sdEff;
+    const d2 = Number.isFinite(a2) && Number.isFinite(b2) ? (a2 - b2) / sdEff : 0;
+    const rebound = d1 * d1 + 0.5 * d2 * d2;
+
+    // 포지션 구성: 센터 차이를 가장 크게, 가드 차이를 가장 작게 봄
+    const dC = cA - cB, dF = fA - fB, dG = gA - gB;
+    const position = dC * dC + 0.5 * dF * dF + 0.25 * dG * dG;
+
+    // 실력: 팀 평균 엘로 점수 차이
+    const dSkill = (eloA / nA - eloB / nB) / sdElo;
+    const skill = dSkill * dSkill;
+
+    // 평균 키 차이
+    const dHeight = (hA / nA - hB / nB) / sdHeight;
+    const heightTerm = dHeight * dHeight;
+
+    return penalty
+      + TEAM_WEIGHTS.rebound * rebound
+      + TEAM_WEIGHTS.position * position
+      + TEAM_WEIGHTS.skill * skill
+      + TEAM_WEIGHTS.height * heightTerm;
+  }
+
+  // 가장 공평한 점수에 아주 가까운 조합까지 후보로 인정 (다시 나누기를 누를 때마다 다른 조합이 나오도록)
+  const nearBest = (best) => best + Math.max(0.15, best * 0.1);
+  let chosen = null;
+
+  if (n <= MAX_EXHAUSTIVE_PLAYERS) {
+    // 모든 조합 계산 (인원이 짝수면 1번 선수를 A팀에 고정해서 같은 조합을 두 번 세지 않음)
+    const masks = [];
+    const costs = [];
+    const limit = 1 << n;
+    let m = (1 << sizeA) - 1;
+    let best = Infinity;
+    while (m < limit) {
+      if (n % 2 === 1 || (m & 1)) {
+        for (let i = 0; i < n; i++) inA[i] = (m >> i) & 1;
+        const c = cost();
+        masks.push(m);
+        costs.push(c);
+        if (c < best) best = c;
+      }
+      // 같은 인원 수를 유지하면서 다음 조합으로 이동
+      const low = m & -m;
+      const r = m + low;
+      m = (((r ^ m) >> 2) / low) | r;
+    }
+    const threshold = nearBest(best);
+    const pool = [];
+    for (let k = 0; k < costs.length; k++) if (costs[k] <= threshold) pool.push(masks[k]);
+    const mask = pool[Math.floor(Math.random() * pool.length)];
+    chosen = new Uint8Array(n);
+    for (let i = 0; i < n; i++) chosen[i] = (mask >> i) & 1;
+  } else {
+    const candidates = []; // { cost, pick: Uint8Array }
+    // 인원이 아주 많으면: 무작위로 나눈 뒤 선수를 한 명씩 맞바꾸며 개선하는 방식
+    const order = [...Array(n).keys()];
+    for (let t = 0; t < 150; t++) {
+      for (let i = n - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [order[i], order[j]] = [order[j], order[i]];
+      }
+      inA.fill(0);
+      for (let k = 0; k < sizeA; k++) inA[order[k]] = 1;
+      let current = cost();
+      let improved = true;
+      while (improved) {
+        improved = false;
+        for (let i = 0; i < n && !improved; i++) {
+          if (!inA[i]) continue;
+          for (let j = 0; j < n; j++) {
+            if (inA[j]) continue;
+            inA[i] = 0; inA[j] = 1;
+            const c = cost();
+            if (c < current - 1e-9) { current = c; improved = true; break; }
+            inA[i] = 1; inA[j] = 0;
+          }
+        }
+      }
+      candidates.push({ cost: current, pick: Uint8Array.from(inA) });
+    }
+    let best = Infinity;
+    for (const c of candidates) if (c.cost < best) best = c.cost;
+    const threshold = nearBest(best);
+    const pool = candidates.filter((c) => c.cost <= threshold);
+    chosen = pool[Math.floor(Math.random() * pool.length)].pick;
+  }
+
+  let A = [];
+  let B = [];
+  attendeePlayers.forEach((p, i) => (chosen[i] ? A : B).push(p.id));
+  if (Math.random() < 0.5) [A, B] = [B, A];
+  return { A, B };
+}
+
+// 팀 배정 결과 화면에 보여줄 팀별 요약
+function teamSummary(ids, playerMap) {
+  const list = ids.map((id) => playerMap[id]).filter(Boolean);
+  const heights = list.map((p) => validHeight(p.height)).filter((h) => h !== null);
+  return {
+    avgHeight: heights.length ? Math.round(heights.reduce((a, b) => a + b, 0) / heights.length) : null,
+    maxHeight: heights.length ? Math.max(...heights) : null,
+    centers: list.filter((p) => p.position === '센터').length,
+    forwards: list.filter((p) => p.position === '포워드').length,
+    guards: list.filter((p) => p.position === '가드').length,
+    avgElo: list.length ? Math.round(teamAverageElo(ids, playerMap)) : null,
+  };
 }
 
 // ============================================================
@@ -281,7 +489,9 @@ function BasketballClubApp() {
   const [loginPassword, setLoginPassword] = useState('');
   const [regName, setRegName] = useState('');
   const [regEmpId, setRegEmpId] = useState('');
+  const [regHeight, setRegHeight] = useState('');
   const [regPosition, setRegPosition] = useState(POSITIONS[0]);
+  const [heightDraft, setHeightDraft] = useState(null);
   const [regPassword, setRegPassword] = useState('');
   const [regPasswordConfirm, setRegPasswordConfirm] = useState('');
 
@@ -374,7 +584,9 @@ function BasketballClubApp() {
     setError('');
     const name = regName.trim();
     const empId = regEmpId.trim();
-    if (!name || !empId || !regPassword) { setError('이름, 사번, 비밀번호를 모두 입력해주세요.'); return; }
+    const height = validHeight(regHeight);
+    if (!name || !empId || !regPassword || !regHeight) { setError('이름, 사번, 키, 비밀번호를 모두 입력해주세요.'); return; }
+    if (height === null) { setError(`키는 ${MIN_HEIGHT}~${MAX_HEIGHT} 사이 숫자(cm)로 입력해주세요.`); return; }
     if (regPassword.length < 4) { setError('비밀번호는 4자 이상으로 설정해주세요.'); return; }
     if (regPassword !== regPasswordConfirm) { setError('비밀번호가 일치하지 않습니다.'); return; }
     setBusy(true);
@@ -385,7 +597,7 @@ function BasketballClubApp() {
       const { hash, method } = await hashPassword(regPassword);
       const newPlayer = {
         id: empId, name, employeeId: empId, passwordHash: hash, passwordMethod: method,
-        position: regPosition, wins: 0, losses: 0, predictionScore: 0,
+        position: regPosition, height, elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0,
         isAdmin: Object.keys(fresh).length === 0,
         createdAt: new Date().toISOString(),
       };
@@ -393,7 +605,7 @@ function BasketballClubApp() {
       await savePlayers(next);
       localStorage.setItem('currentPlayerId', empId);
       setCurrentPlayerId(empId);
-      setRegName(''); setRegEmpId(''); setRegPassword(''); setRegPasswordConfirm('');
+      setRegName(''); setRegEmpId(''); setRegHeight(''); setRegPassword(''); setRegPasswordConfirm('');
     } catch (e) {
       setError(`가입 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
     } finally {
@@ -437,8 +649,6 @@ function BasketballClubApp() {
   const iAttend = currentPlayerId ? !!daily.attendance?.[currentPlayerId] : false;
 
   const sortedHistory = [...(me?.history || [])].sort((a, b) => (a.date < b.date ? 1 : -1));
-  const totalPredictionsMade = (me?.history || []).filter((h) => h.predicted).length;
-  const predictionAccuracyLabel = totalPredictionsMade === 0 ? '-' : `${Math.round(((me?.predictionScore || 0) / totalPredictionsMade) * 100)}%`;
 
   const handleToggleAttendance = async () => {
     if (daily.result?.finalized) return;
@@ -485,9 +695,19 @@ function BasketballClubApp() {
     if (!daily.teams || daily.result?.finalized) return;
     setBusy(true);
     try {
+      // 다른 사람이 방금 가입하거나 정보를 바꿨을 수 있으니 최신 데이터로 계산
+      const pRes = await api.get('players').catch(() => null);
+      const freshPlayers = pRes ? JSON.parse(pRes.value) : players;
+
       const allIds = new Set([...daily.teams.A, ...daily.teams.B, ...Object.keys(daily.predictions || {})]);
-      const nextPlayers = { ...players };
+      const nextPlayers = { ...freshPlayers };
       const deltas = [];
+
+      // 엘로: 경기 전 점수로 예상 승률을 계산하고, 결과와의 차이만큼 점수 조정
+      const eloA = teamAverageElo(daily.teams.A, freshPlayers);
+      const eloB = teamAverageElo(daily.teams.B, freshPlayers);
+      const expectA = expectedWinA(eloA, eloB);
+      const scoreA = winner === 'A' ? 1 : 0;
 
       allIds.forEach((id) => {
         if (!nextPlayers[id]) return;
@@ -502,16 +722,25 @@ function BasketballClubApp() {
         const lossesDelta = won === false ? 1 : 0;
         const predictionScoreDelta = predictionCorrect ? 1 : 0;
 
-        const historyEntry = { date: dateKey, team, result: team ? (won ? 'win' : 'loss') : null, predicted, predictionCorrect };
+        let eloDelta = 0;
+        if (team) {
+          const k = gamesPlayed(nextPlayers[id]) < ELO_NEW_GAMES ? ELO_K_NEW : ELO_K;
+          const actual = team === 'A' ? scoreA : 1 - scoreA;
+          const expected = team === 'A' ? expectA : 1 - expectA;
+          eloDelta = Math.round(k * (actual - expected) * 10) / 10;
+        }
+
+        const historyEntry = { date: dateKey, team, result: team ? (won ? 'win' : 'loss') : null, predicted, predictionCorrect, eloDelta: team ? eloDelta : null };
 
         nextPlayers[id] = {
           ...nextPlayers[id],
           wins: (nextPlayers[id].wins || 0) + winsDelta,
           losses: (nextPlayers[id].losses || 0) + lossesDelta,
           predictionScore: (nextPlayers[id].predictionScore || 0) + predictionScoreDelta,
+          elo: eloOf(nextPlayers[id]) + eloDelta,
           history: [...(nextPlayers[id].history || []), historyEntry],
         };
-        deltas.push({ playerId: id, winsDelta, lossesDelta, predictionScoreDelta });
+        deltas.push({ playerId: id, winsDelta, lossesDelta, predictionScoreDelta, eloDelta });
       });
 
       await savePlayers(nextPlayers);
@@ -547,6 +776,7 @@ function BasketballClubApp() {
           wins: (nextPlayers[d.playerId].wins || 0) - d.winsDelta,
           losses: (nextPlayers[d.playerId].losses || 0) - d.lossesDelta,
           predictionScore: (nextPlayers[d.playerId].predictionScore || 0) - d.predictionScoreDelta,
+          elo: eloOf(nextPlayers[d.playerId]) - (d.eloDelta || 0),
           history: filteredHistory,
         };
       });
@@ -594,6 +824,25 @@ function BasketballClubApp() {
       await savePlayers(next);
     } catch (e) {
       setError(`포지션 변경 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
+    }
+  };
+
+  const handleHeightSave = async () => {
+    setError('');
+    const h = validHeight(heightDraft);
+    if (h === null) { setError(`키는 ${MIN_HEIGHT}~${MAX_HEIGHT} 사이 숫자(cm)로 입력해주세요.`); return; }
+    setBusy(true);
+    try {
+      const pRes = await api.get('players').catch(() => null);
+      const fresh = pRes ? JSON.parse(pRes.value) : players;
+      if (!fresh[currentPlayerId]) { setError('내 정보를 찾을 수 없습니다.'); return; }
+      const next = { ...fresh, [currentPlayerId]: { ...fresh[currentPlayerId], height: h } };
+      await savePlayers(next);
+      setHeightDraft(null);
+    } catch (e) {
+      setError(`키 저장 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -714,14 +963,44 @@ function BasketballClubApp() {
     }
   };
 
-  const rankedPlayers = Object.values(players).sort((a, b) => {
-    if (rankMode === 'winrate') {
-      const wr = winRate(b) - winRate(a);
-      if (wr !== 0) return wr;
-      return (b.wins + b.losses) - (a.wins + a.losses);
-    }
-    return (b.predictionScore || 0) - (a.predictionScore || 0);
+  // 랭킹 3가지를 각각 따로 정렬
+  // - 승률 랭킹: 윌슨 점수, 20경기 이상만 순위 (나머지는 '랭킹 진입 전'에 경기 수 많은 순)
+  // - 적중률 랭킹: 윌슨 점수
+  // - Rating 랭킹: 엘로 점수, 20경기 이상만 순위
+  const scoredPlayers = Object.values(players).map((p) => {
+    const games = gamesPlayed(p);
+    const pred = predictionStats(p);
+    const lastElo = [...(p.history || [])].reverse().find((h) => typeof h.eloDelta === 'number');
+    return {
+      ...p,
+      games,
+      pred,
+      winScore: wilsonScore(p.wins || 0, games),
+      predScore: wilsonScore(pred.correct, pred.total),
+      skill: eloOf(p),
+      lastEloDelta: lastElo ? lastElo.eloDelta : null,
+    };
   });
+  const qualifies = (p) => p.games >= RANKING_MIN_GAMES;
+  const winRanking = [...scoredPlayers].sort((a, b) =>
+    (qualifies(b) - qualifies(a))
+    || (qualifies(a) ? (b.winScore - a.winScore) || (b.games - a.games) : (b.games - a.games) || (b.winScore - a.winScore)));
+  const predRanking = [...scoredPlayers].sort((a, b) => (b.predScore - a.predScore) || (b.pred.total - a.pred.total));
+  const skillRanking = [...scoredPlayers].sort((a, b) =>
+    (qualifies(b) - qualifies(a))
+    || (qualifies(a) ? (b.skill - a.skill) || (b.games - a.games) : (b.games - a.games) || (b.skill - a.skill)));
+  const rankedPlayers = rankMode === 'skill' ? skillRanking : (rankMode === 'prediction' ? predRanking : winRanking);
+
+  const myGames = gamesPlayed(me);
+  const myPred = predictionStats(me);
+  const mySkill = Math.round(eloOf(me));
+  const myWinRankIdx = winRanking.findIndex((p) => p.id === currentPlayerId);
+  const myPredRankIdx = predRanking.findIndex((p) => p.id === currentPlayerId);
+  const mySkillRankIdx = skillRanking.findIndex((p) => p.id === currentPlayerId);
+  const entryLabel = myGames > 0 ? `랭킹 진입까지 ${RANKING_MIN_GAMES - myGames}경기` : '아직 경기 기록 없음';
+  const myWinRankLabel = myGames >= RANKING_MIN_GAMES && myWinRankIdx >= 0 ? `승률 랭킹 ${myWinRankIdx + 1}위` : entryLabel;
+  const myPredRankLabel = myPred.total > 0 && myPredRankIdx >= 0 ? `적중률 랭킹 ${myPredRankIdx + 1}위` : '아직 예측 기록 없음';
+  const mySkillRankLabel = myGames >= RANKING_MIN_GAMES && mySkillRankIdx >= 0 ? `Rating 랭킹 ${mySkillRankIdx + 1}위` : entryLabel;
 
   if (!apiConfigured) {
     return (
@@ -796,6 +1075,7 @@ function BasketballClubApp() {
               <div className="space-y-3">
                 <input value={regName} onChange={(e) => setRegName(e.target.value)} placeholder="이름" className="w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" />
                 <input value={regEmpId} onChange={(e) => setRegEmpId(e.target.value)} placeholder="사번" className="w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" />
+                <input value={regHeight} onChange={(e) => setRegHeight(e.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric" placeholder="키 (cm, 예: 178)" className="w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" />
                 <div className="flex gap-2">
                   {POSITIONS.map((pos) => (
                     <button
@@ -871,6 +1151,12 @@ function BasketballClubApp() {
             <div className="space-y-4">
               <p className="text-slate-400 text-xs font-bold tracking-wide">{formatDateLabel(dateKey)} 오늘의 경기</p>
 
+              {!validHeight(me.height) && (
+                <button onClick={() => setTab('mypage')} className="w-full bg-orange-50 text-orange-700 rounded-xl px-4 py-3 text-xs font-bold text-left">
+                  키를 입력하면 팀 배정이 더 정확해져요. 마이페이지에서 입력하기
+                </button>
+              )}
+
               <div className="bg-white rounded-2xl p-4 shadow-sm">
                 <div className="flex items-center justify-between mb-3">
                   <div className="flex items-center gap-1.5 text-slate-800 font-bold text-sm">
@@ -922,6 +1208,19 @@ function BasketballClubApp() {
                     <div className="p-3">
                       {daily.teams.B.map((id) => <PlayerRow key={id} player={players[id]} tone="bg-orange-600" />)}
                     </div>
+                  </div>
+                  <div className="grid grid-cols-2 divide-x divide-slate-100 border-t border-slate-100 bg-slate-50">
+                    {['A', 'B'].map((t) => {
+                      const s = teamSummary(daily.teams[t], players);
+                      return (
+                        <div key={t} className="px-3 py-2.5 space-y-0.5 text-xs text-slate-500">
+                          <p>평균 키 <span className="font-bold text-slate-700">{s.avgHeight ? `${s.avgHeight}cm` : '-'}</span></p>
+                          <p>최장신 <span className="font-bold text-slate-700">{s.maxHeight ? `${s.maxHeight}cm` : '-'}</span></p>
+                          <p>빅맨 <span className="font-bold text-slate-700">{s.centers + s.forwards}명</span> (센터 {s.centers}, 포워드 {s.forwards})</p>
+                          <p>평균 Rating <span className="font-bold text-slate-700">{s.avgElo ?? '-'}</span></p>
+                        </div>
+                      );
+                    })}
                   </div>
                   {me.isAdmin && !daily.result?.finalized && (
                     <button onClick={handleGenerateTeams} disabled={busy} className="w-full py-2.5 text-xs font-bold text-slate-500 border-t border-slate-100">
@@ -997,31 +1296,63 @@ function BasketballClubApp() {
           {tab === 'ranking' && (
             <div className="space-y-3">
               <div className="flex rounded-lg bg-slate-100 p-1">
-                <button onClick={() => setRankMode('winrate')} className={`flex-1 py-2 rounded-md text-xs font-bold ${rankMode === 'winrate' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}>승률순</button>
-                <button onClick={() => setRankMode('prediction')} className={`flex-1 py-2 rounded-md text-xs font-bold ${rankMode === 'prediction' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}>예측왕순</button>
+                {[['winrate', '승률 랭킹'], ['prediction', '적중률 랭킹'], ['skill', 'Rating']].map(([mode, label]) => (
+                  <button
+                    key={mode}
+                    onClick={() => setRankMode(mode)}
+                    className={`flex-1 py-2 rounded-md text-xs font-bold ${rankMode === mode ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
+              <p className="text-xs text-slate-400 leading-relaxed px-1">
+                {rankMode === 'skill' && `팀 전력까지 고려한 Rating 순이에요. 예상보다 잘하면 오르고 못하면 내려가요. ${RANKING_MIN_GAMES}경기 이상 뛴 사람만 순위에 들어가요.`}
+                {rankMode === 'winrate' && `승률과 판수를 함께 보고 매긴 점수 순이에요. 판수가 적으면 점수가 낮게 나오고, 기록이 쌓일수록 실제 승률에 가까워져요. ${RANKING_MIN_GAMES}경기 이상 뛴 사람만 순위에 들어가요.`}
+                {rankMode === 'prediction' && '적중률과 예측 횟수를 함께 보고 매긴 점수 순이에요. 예측 횟수가 적으면 점수가 낮게 나오고, 기록이 쌓일수록 실제 적중률에 가까워져요.'}
+              </p>
               <div className="bg-white rounded-2xl shadow-sm divide-y divide-slate-100">
                 {rankedPlayers.length === 0 && <p className="text-slate-400 text-xs p-4 text-center">등록된 선수가 없어요.</p>}
-                {rankedPlayers.map((p, idx) => (
-                  <div key={p.id} className={`flex items-center gap-3 px-4 py-3 ${p.id === currentPlayerId ? 'bg-orange-50' : ''}`}>
-                    <span className={`font-display text-sm w-5 text-center ${idx === 0 ? 'text-amber-500' : 'text-slate-300'}`}>{idx + 1}</span>
-                    <Avatar name={p.name} size="sm" tone={idx === 0 ? 'bg-amber-500' : 'bg-slate-700'} />
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-sm font-bold text-slate-800 truncate">{p.name}</span>
-                        <PositionBadge position={p.position} />
-                      </div>
-                      <p className="text-xs text-slate-400 font-medium">{p.wins || 0}승 {p.losses || 0}패</p>
-                    </div>
-                    <div className="text-right">
-                      {rankMode === 'winrate' ? (
-                        <p className="text-sm font-black text-slate-800">{winRatePct(p)}</p>
-                      ) : (
-                        <p className="text-sm font-black text-slate-800">{p.predictionScore || 0}점</p>
+                {rankedPlayers.map((p, idx) => {
+                  const needsGames = rankMode !== 'prediction';
+                  const ranked = needsGames ? p.games >= RANKING_MIN_GAMES : p.pred.total > 0;
+                  const firstUnranked = needsGames && !ranked && (idx === 0 || rankedPlayers[idx - 1].games >= RANKING_MIN_GAMES);
+                  const remaining = `랭킹 진입까지 ${RANKING_MIN_GAMES - p.games}경기`;
+
+                  let detail;
+                  let scoreLabel;
+                  if (rankMode === 'skill') {
+                    const recent = typeof p.lastEloDelta === 'number' ? ` · 최근 ${p.lastEloDelta >= 0 ? '+' : ''}${Math.round(p.lastEloDelta)}` : '';
+                    detail = p.games === 0 ? '아직 경기 기록 없음' : `${p.games}경기${recent}${ranked ? '' : ` · ${remaining}`}`;
+                    scoreLabel = p.games > 0 ? `${Math.round(p.skill)}` : '-';
+                  } else if (rankMode === 'prediction') {
+                    detail = ranked ? `${p.pred.total}번 중 ${p.pred.correct}번 적중 · ${pct(p.pred.correct, p.pred.total)}` : '아직 예측 기록 없음';
+                    scoreLabel = ranked ? `${Math.round(p.predScore * 100)}점` : '-';
+                  } else {
+                    detail = p.games === 0 ? '아직 경기 기록 없음' : `${p.wins || 0}승 ${p.losses || 0}패 · 승률 ${pct(p.wins || 0, p.games)}${ranked ? '' : ` · ${remaining}`}`;
+                    scoreLabel = p.games > 0 ? `${Math.round(p.winScore * 100)}점` : '-';
+                  }
+                  const isTop = idx === 0 && ranked;
+                  return (
+                    <React.Fragment key={p.id}>
+                      {firstUnranked && (
+                        <p className="px-4 py-2 bg-slate-50 text-xs font-bold text-slate-400">랭킹 진입 전 ({RANKING_MIN_GAMES}경기 미만)</p>
                       )}
-                    </div>
-                  </div>
-                ))}
+                      <div className={`flex items-center gap-3 px-4 py-3 ${p.id === currentPlayerId ? 'bg-orange-50' : ''}`}>
+                        <span className={`font-display text-sm w-5 text-center ${isTop ? 'text-amber-500' : 'text-slate-300'}`}>{ranked ? idx + 1 : '-'}</span>
+                        <Avatar name={p.name} size="sm" tone={isTop ? 'bg-amber-500' : 'bg-slate-700'} />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-sm font-bold text-slate-800 truncate">{p.name}</span>
+                            <PositionBadge position={p.position} />
+                          </div>
+                          <p className="text-xs text-slate-400 font-medium">{detail}</p>
+                        </div>
+                        <p className={`text-sm font-black shrink-0 ${ranked ? 'text-slate-800' : 'text-slate-300'}`}>{scoreLabel}</p>
+                      </div>
+                    </React.Fragment>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -1048,20 +1379,48 @@ function BasketballClubApp() {
                     {POSITIONS.map((pos) => <option key={pos} value={pos}>{pos}</option>)}
                   </select>
                 </div>
+                <div className="flex items-center justify-between mt-3">
+                  <span className="text-sm font-semibold text-slate-600">키</span>
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={heightDraft ?? (me.height ? String(me.height) : '')}
+                      onChange={(e) => setHeightDraft(e.target.value.replace(/[^0-9]/g, ''))}
+                      inputMode="numeric" placeholder="미입력"
+                      className="w-20 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-3 py-1.5 text-right focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                    <span className="text-sm text-slate-500">cm</span>
+                    {heightDraft !== null && heightDraft !== String(me.height || '') && (
+                      <button onClick={handleHeightSave} disabled={busy} className="text-xs font-bold text-white bg-orange-600 rounded-lg px-2.5 py-1.5 disabled:opacity-60">저장</button>
+                    )}
+                  </div>
+                </div>
               </div>
 
-              <div className="bg-white rounded-2xl p-4 shadow-sm grid grid-cols-3 divide-x divide-slate-100 text-center">
+              <div className="bg-white rounded-2xl p-4 shadow-sm flex items-center justify-between">
                 <div>
-                  <p className="text-lg font-black text-slate-800">{winRatePct(me)}</p>
-                  <p className="text-xs text-slate-400 font-medium mt-0.5">{me.wins || 0}승 {me.losses || 0}패</p>
+                  <p className="text-xs text-slate-400 font-bold">Rating</p>
+                  <p className="text-2xl font-black text-slate-800 mt-1">{myGames > 0 ? mySkill : '-'}</p>
                 </div>
-                <div>
-                  <p className="text-lg font-black text-slate-800">{me.predictionScore || 0}점</p>
-                  <p className="text-xs text-slate-400 font-medium mt-0.5">예측 점수</p>
+                <div className="text-right">
+                  <p className="text-xs text-orange-600 font-bold">{mySkillRankLabel}</p>
+                  {myGames > 0 && myGames < ELO_NEW_GAMES && (
+                    <p className="text-xs text-slate-400 font-medium mt-0.5">배치 중 {myGames}/{ELO_NEW_GAMES}경기</p>
+                  )}
                 </div>
-                <div>
-                  <p className="text-lg font-black text-slate-800">{predictionAccuracyLabel}</p>
-                  <p className="text-xs text-slate-400 font-medium mt-0.5">예측 정확도</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-white rounded-2xl p-4 shadow-sm">
+                  <p className="text-xs text-slate-400 font-bold">승률</p>
+                  <p className="text-2xl font-black text-slate-800 mt-1">{pct(me.wins || 0, myGames)}</p>
+                  <p className="text-xs text-slate-500 font-medium mt-1">{me.wins || 0}승 {me.losses || 0}패</p>
+                  <p className="text-xs text-orange-600 font-bold mt-0.5">{myWinRankLabel}</p>
+                </div>
+                <div className="bg-white rounded-2xl p-4 shadow-sm">
+                  <p className="text-xs text-slate-400 font-bold">적중률</p>
+                  <p className="text-2xl font-black text-slate-800 mt-1">{pct(myPred.correct, myPred.total)}</p>
+                  <p className="text-xs text-slate-500 font-medium mt-1">{myPred.total}번 중 {myPred.correct}번 적중</p>
+                  <p className="text-xs text-orange-600 font-bold mt-0.5">{myPredRankLabel}</p>
                 </div>
               </div>
 
@@ -1131,6 +1490,9 @@ function BasketballClubApp() {
                             <span className={`text-xs font-bold px-2 py-0.5 rounded ${h.result === 'win' ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
                               {h.result === 'win' ? '승' : '패'}
                             </span>
+                          )}
+                          {typeof h.eloDelta === 'number' && (
+                            <p className="text-xs text-slate-400 font-medium mt-1">Rating {h.eloDelta >= 0 ? '+' : ''}{Math.round(h.eloDelta)}</p>
                           )}
                           {h.predicted && (
                             <p className={`text-xs font-medium mt-1 ${h.predictionCorrect ? 'text-emerald-600' : 'text-slate-400'}`}>
