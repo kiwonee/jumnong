@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>우리 농구단</title>
+<title>점농회</title>
 
 <!-- 앱 설치(홈 화면 추가) 관련 설정 -->
 <link rel="manifest" href="manifest.json">
@@ -12,7 +12,7 @@
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="농구단">
+<meta name="apple-mobile-web-app-title" content="점농회">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 
 <!-- API 주소 등 설정값 (index.html을 새 버전으로 바꿔도 이 파일은 그대로 두세요) -->
@@ -57,7 +57,7 @@ const { useState, useEffect } = React;
 // ============================================================
 const APP_CONFIG = window.APP_CONFIG || {};
 const API_URL = APP_CONFIG.API_URL || 'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
-const CLUB_NAME = APP_CONFIG.CLUB_NAME || '우리 농구단';
+const CLUB_NAME = APP_CONFIG.CLUB_NAME || '점농회';
 const ADMIN_CODE = APP_CONFIG.ADMIN_CODE || 'HOOP2026';
 const POSITIONS = ['가드', '포워드', '센터'];
 
