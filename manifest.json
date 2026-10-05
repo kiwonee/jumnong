@@ -1,7 +1,7 @@
 {
   "id": "./",
-  "name": "우리 농구단",
-  "short_name": "농구단",
+  "name": "점농회",
+  "short_name": "점농회",
   "description": "출석, 팀 편성, 승부예측",
   "start_url": "./",
   "scope": "./",
