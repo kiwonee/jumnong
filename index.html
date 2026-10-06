@@ -59,7 +59,29 @@ const APP_CONFIG = window.APP_CONFIG || {};
 const API_URL = APP_CONFIG.API_URL || 'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
 const CLUB_NAME = APP_CONFIG.CLUB_NAME || '점농회';
 const ADMIN_CODE = APP_CONFIG.ADMIN_CODE || 'HOOP2026';
-const POSITIONS = ['가드', '포워드', '센터'];
+const POSITIONS = ['포인트가드', '슈팅가드', '스몰포워드', '파워포워드', '센터'];
+const POSITION_ABBR = { '포인트가드': 'PG', '슈팅가드': 'SG', '스몰포워드': 'SF', '파워포워드': 'PF', '센터': 'C' };
+const POSITION_SHORT = { '포인트가드': '포인트', '슈팅가드': '슈팅', '스몰포워드': '스몰', '파워포워드': '파워', '센터': '센터' };
+const GUARD_POSITIONS = ['포인트가드', '슈팅가드'];
+const BIG_POSITIONS = ['파워포워드', '센터'];
+
+// 예전 3단계 포지션(가드/포워드/센터)으로 가입한 회원은 자동으로 바꿔서 읽어요
+const LEGACY_POSITION_MAP = { '가드': '슈팅가드', '포워드': '스몰포워드' };
+
+function normalizePosition(pos) {
+  if (POSITIONS.includes(pos)) return pos;
+  return LEGACY_POSITION_MAP[pos] || '스몰포워드';
+}
+
+function normalizePlayers(map) {
+  const out = {};
+  Object.entries(map || {}).forEach(([id, p]) => { out[id] = { ...p, position: normalizePosition(p.position) }; });
+  return out;
+}
+
+function parsePlayers(res) {
+  return res ? normalizePlayers(JSON.parse(res.value)) : {};
+}
 
 // ============================================================
 // API 레이어 (Apps Script 백엔드와 통신)
@@ -131,6 +153,12 @@ function formatDateLabel(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
   const days = ['일', '월', '화', '수', '목', '금', '토'];
   return `${d.getMonth() + 1}월 ${d.getDate()}일 (${days[d.getDay()]})`;
+}
+
+function shiftDate(dateStr, days) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 function formatDateTime(iso) {
@@ -245,13 +273,17 @@ function expectedWinA(eloA, eloB) {
 // 1) 무조건 지킬 규칙을 어기면 큰 벌점
 // 2) 리바운드 > 포지션 구성 > 실력 > 평균 키 순으로 두 팀의 차이를 점수화
 // 3) 가능한 조합을 전부 계산해서 가장 공평한 조합들 중 하나를 무작위로 선택
+// 팀 수: 6·8·10명 2팀, 9·12·15명 3팀, 16명 4팀 (관리자가 바꿀 수 있음)
 // ============================================================
-const POSITION_HEIGHT_BONUS = { '가드': 0, '포워드': 3, '센터': 6 }; // 리바운드용 유효 키 보정(cm)
+// 리바운드용 유효 키 보정(cm)
+const POSITION_HEIGHT_BONUS = { '포인트가드': 0, '슈팅가드': 1, '스몰포워드': 3, '파워포워드': 5, '센터': 6 };
+// 두 팀의 포지션 수가 다를 때 벌점 크기 (센터 차이를 가장 크게 봄)
+const POSITION_BALANCE_WEIGHT = { '포인트가드': 0.5, '슈팅가드': 0.3, '스몰포워드': 0.3, '파워포워드': 0.7, '센터': 1.0 };
 const TEAM_WEIGHTS = { rebound: 4, position: 3, skill: 2, height: 1 };
 const MIN_HEIGHT = 140;
 const MAX_HEIGHT = 220;
 const DEFAULT_HEIGHT = 175;
-const MAX_EXHAUSTIVE_PLAYERS = 22; // 이 인원까지는 모든 조합을 다 계산
+const MAX_EXHAUSTIVE = { 2: 22, 3: 15, 4: 12 }; // 팀 수별로 이 인원까지는 모든 조합을 다 계산
 const HARD_PENALTY = 1000;
 
 function validHeight(h) {
@@ -266,69 +298,137 @@ function stdDev(values, floor) {
   return Math.max(Math.sqrt(variance), floor);
 }
 
-function generateTeams(attendeePlayers) {
+const TEAM_LABELS = ['A', 'B', 'C', 'D'];
+const TEAM_STYLE = {
+  A: { light: 'text-blue-400', dark: 'text-blue-600', tone: 'bg-blue-600', soft: 'border-blue-600 bg-blue-50' },
+  B: { light: 'text-orange-400', dark: 'text-orange-600', tone: 'bg-orange-600', soft: 'border-orange-600 bg-orange-50' },
+  C: { light: 'text-emerald-400', dark: 'text-emerald-600', tone: 'bg-emerald-600', soft: 'border-emerald-600 bg-emerald-50' },
+  D: { light: 'text-violet-400', dark: 'text-violet-600', tone: 'bg-violet-600', soft: 'border-violet-600 bg-violet-50' },
+};
+
+// 참가 인원별 팀 수
+const TEAM_COUNT_BY_SIZE = { 6: 2, 8: 2, 10: 2, 9: 3, 12: 3, 15: 3, 16: 4 };
+const VALID_SIZES = Object.keys(TEAM_COUNT_BY_SIZE).map(Number).sort((a, b) => a - b);
+
+// 팀을 짤 수 있는 인원까지 몇 명 더 필요한지 (5, 7, 11, 14명 → 1명 / 4, 13명 → 2명)
+function moreNeeded(n) {
+  if (n <= 0 || TEAM_COUNT_BY_SIZE[n]) return 0;
+  const next = VALID_SIZES.find((v) => v > n);
+  return next ? next - n : 0;
+}
+
+// 기본 팀 수: 표에 있으면 그대로, 없으면 다음 목표 인원의 팀 수 (16명 초과는 4팀)
+function defaultTeamCount(n) {
+  if (TEAM_COUNT_BY_SIZE[n]) return TEAM_COUNT_BY_SIZE[n];
+  const next = VALID_SIZES.find((v) => v > n);
+  return next ? TEAM_COUNT_BY_SIZE[next] : 4;
+}
+
+// 하루 일정 (휴대폰 시간 기준)
+const SIGNUP_OPEN_MIN = 5 * 60;           // 참가신청 오픈 05:00
+const SIGNUP_CLOSE_MIN = 11 * 60 + 45;    // 참가신청 마감 11:45
+const PREDICTION_CLOSE_MIN = 12 * 60 + 30; // 결과예측 마감 12:30
+
+// 겹치지 않는 고유 번호 (같은 순간에 두 사람이 저장해도 다르게)
+function uniqueId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function minutesOfDay(d) {
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+// 경기 결과 입력 잠금: 마지막 신호 후 이 시간이 지나면 자동으로 풀림
+const EDIT_LOCK_TTL_MS = 3 * 60 * 1000;
+const EDIT_LOCK_HEARTBEAT_MS = 45 * 1000;
+
+function lockActive(lock) {
+  return !!lock && Date.now() - new Date(lock.at).getTime() < EDIT_LOCK_TTL_MS;
+}
+
+// 팀 이름 표시 (A → A팀, 직접 구성의 '팀1'은 그대로)
+function sideName(label) {
+  return TEAM_LABELS.includes(label) ? `${label}팀` : label;
+}
+
+function generateTeams(attendeePlayers, teamCount) {
   const n = attendeePlayers.length;
+  const k = Math.max(2, Math.min(teamCount || defaultTeamCount(n), 4, Math.floor(n / 2) || 2));
   if (n < 2) return { A: attendeePlayers.map((p) => p.id), B: [] };
 
   // 키를 입력하지 않은 사람은 오늘 참석자 평균 키로 계산
   const known = attendeePlayers.map((p) => validHeight(p.height)).filter((h) => h !== null);
   const fallbackHeight = known.length ? known.reduce((a, b) => a + b, 0) / known.length : DEFAULT_HEIGHT;
 
-  const pos = attendeePlayers.map((p) => (POSITIONS.includes(p.position) ? p.position : '포워드'));
+  const pos = attendeePlayers.map((p) => normalizePosition(p.position));
   const height = attendeePlayers.map((p) => validHeight(p.height) ?? fallbackHeight);
   const eff = height.map((h, i) => h + (POSITION_HEIGHT_BONUS[pos[i]] || 0));
   const elo = attendeePlayers.map(eloOf);
+  const posIdx = pos.map((p) => POSITIONS.indexOf(p));
   const isC = pos.map((p) => (p === '센터' ? 1 : 0));
-  const isF = pos.map((p) => (p === '포워드' ? 1 : 0));
-  const isG = pos.map((p) => (p === '가드' ? 1 : 0));
+  const isBig = pos.map((p) => (BIG_POSITIONS.includes(p) ? 1 : 0));
+  const isGuard = pos.map((p) => (GUARD_POSITIONS.includes(p) ? 1 : 0));
   const totalC = isC.reduce((a, b) => a + b, 0);
-  const totalG = isG.reduce((a, b) => a + b, 0);
+  const totalGuard = isGuard.reduce((a, b) => a + b, 0);
+  const balanceWeight = POSITIONS.map((p) => POSITION_BALANCE_WEIGHT[p]);
+  const P = POSITIONS.length;
 
   // 단위가 다른 값을 같은 눈금으로 맞추기 위한 기준 (오늘 참석자들 사이의 표준편차)
   const sdEff = stdDev(eff, 3);
   const sdHeight = stdDev(height, 3);
   const sdElo = stdDev(elo, 50);
 
-  const sizeA = Math.floor(n / 2);
-  const inA = new Uint8Array(n);
+  const assign = new Int8Array(n); // 선수별 팀 번호 (0, 1, 2)
+  const tN = new Float64Array(k), tElo = new Float64Array(k), tH = new Float64Array(k);
+  const tC = new Int32Array(k), tBig = new Int32Array(k), tGuard = new Int32Array(k);
+  const top1 = new Float64Array(k), top2 = new Float64Array(k);
+  const cnt = new Int32Array(k * P);
 
   function cost() {
-    let nA = 0, nB = 0, eloA = 0, eloB = 0, hA = 0, hB = 0;
-    let cA = 0, cB = 0, fA = 0, fB = 0, gA = 0, gB = 0;
-    let a1 = -Infinity, a2 = -Infinity, b1 = -Infinity, b2 = -Infinity;
+    tN.fill(0); tElo.fill(0); tH.fill(0); tC.fill(0); tBig.fill(0); tGuard.fill(0); cnt.fill(0);
+    top1.fill(-Infinity); top2.fill(-Infinity);
     for (let i = 0; i < n; i++) {
+      const t = assign[i];
+      tN[t]++; tElo[t] += elo[i]; tH[t] += height[i];
+      tC[t] += isC[i]; tBig[t] += isBig[i]; tGuard[t] += isGuard[i];
+      cnt[t * P + posIdx[i]]++;
       const v = eff[i];
-      if (inA[i]) {
-        nA++; eloA += elo[i]; hA += height[i]; cA += isC[i]; fA += isF[i]; gA += isG[i];
-        if (v > a1) { a2 = a1; a1 = v; } else if (v > a2) { a2 = v; }
-      } else {
-        nB++; eloB += elo[i]; hB += height[i]; cB += isC[i]; fB += isF[i]; gB += isG[i];
-        if (v > b1) { b2 = b1; b1 = v; } else if (v > b2) { b2 = v; }
-      }
+      if (v > top1[t]) { top2[t] = top1[t]; top1[t] = v; } else if (v > top2[t]) { top2[t] = v; }
     }
 
     // 1) 무조건 지킬 규칙
     let penalty = 0;
-    if (totalC >= 2 && (cA === 0 || cB === 0)) penalty += HARD_PENALTY;       // 센터 2명 이상이면 팀마다 1명 이상
-    if (Math.abs((cA + fA) - (cB + fB)) > 1) penalty += HARD_PENALTY;         // 빅맨 수 차이 1명 이하
-    if (totalG >= 2 && (gA === 0 || gB === 0)) penalty += HARD_PENALTY;       // 가드 2명 이상이면 팀마다 1명 이상
+    let minC = Infinity, maxC = -Infinity, minBig = Infinity, maxBig = -Infinity, minGuard = Infinity;
+    for (let t = 0; t < k; t++) {
+      minC = Math.min(minC, tC[t]); maxC = Math.max(maxC, tC[t]);
+      minBig = Math.min(minBig, tBig[t]); maxBig = Math.max(maxBig, tBig[t]);
+      minGuard = Math.min(minGuard, tGuard[t]);
+    }
+    if (totalC >= k ? minC < 1 : maxC > 1) penalty += HARD_PENALTY;      // 센터는 팀마다 고르게 (팀 수 이상이면 팀마다 1명 이상)
+    if (maxBig - minBig > 1) penalty += HARD_PENALTY;                      // 빅맨(PF+C) 수 차이 1명 이하
+    if (totalGuard >= k && minGuard < 1) penalty += HARD_PENALTY;          // 가드(PG+SG)가 팀 수 이상이면 팀마다 1명 이상
 
-    // 2) 리바운드: 팀에서 가장 큰 빅맨끼리, 두 번째 빅맨끼리 비교 (첫 번째가 더 중요)
-    const d1 = (a1 - b1) / sdEff;
-    const d2 = Number.isFinite(a2) && Number.isFinite(b2) ? (a2 - b2) / sdEff : 0;
-    const rebound = d1 * d1 + 0.5 * d2 * d2;
-
-    // 포지션 구성: 센터 차이를 가장 크게, 가드 차이를 가장 작게 봄
-    const dC = cA - cB, dF = fA - fB, dG = gA - gB;
-    const position = dC * dC + 0.5 * dF * dF + 0.25 * dG * dG;
-
-    // 실력: 팀 평균 엘로 점수 차이
-    const dSkill = (eloA / nA - eloB / nB) / sdElo;
-    const skill = dSkill * dSkill;
-
-    // 평균 키 차이
-    const dHeight = (hA / nA - hB / nB) / sdHeight;
-    const heightTerm = dHeight * dHeight;
+    // 2) 모든 팀 쌍을 서로 비교해서 차이를 합산
+    let rebound = 0, position = 0, skill = 0, heightTerm = 0;
+    for (let a = 0; a < k; a++) {
+      for (let b = a + 1; b < k; b++) {
+        // 리바운드: 팀에서 가장 큰 빅맨끼리, 두 번째 빅맨끼리 비교 (첫 번째가 더 중요)
+        const d1 = (top1[a] - top1[b]) / sdEff;
+        const d2 = Number.isFinite(top2[a]) && Number.isFinite(top2[b]) ? (top2[a] - top2[b]) / sdEff : 0;
+        rebound += d1 * d1 + 0.5 * d2 * d2;
+        // 포지션 구성: 포지션별 인원 차이에 비중을 곱해서 합산
+        for (let q = 0; q < P; q++) {
+          const d = cnt[a * P + q] - cnt[b * P + q];
+          position += balanceWeight[q] * d * d;
+        }
+        // Rating: 팀 평균 차이
+        const ds = (tElo[a] / tN[a] - tElo[b] / tN[b]) / sdElo;
+        skill += ds * ds;
+        // 평균 키 차이
+        const dh = (tH[a] / tN[a] - tH[b] / tN[b]) / sdHeight;
+        heightTerm += dh * dh;
+      }
+    }
 
     return penalty
       + TEAM_WEIGHTS.rebound * rebound
@@ -339,61 +439,73 @@ function generateTeams(attendeePlayers) {
 
   // 가장 공평한 점수에 아주 가까운 조합까지 후보로 인정 (다시 나누기를 누를 때마다 다른 조합이 나오도록)
   const nearBest = (best) => best + Math.max(0.15, best * 0.1);
+  const minSize = Math.floor(n / k);
+  const maxSize = Math.ceil(n / k);
   let chosen = null;
 
-  if (n <= MAX_EXHAUSTIVE_PLAYERS) {
-    // 모든 조합 계산 (인원이 짝수면 1번 선수를 A팀에 고정해서 같은 조합을 두 번 세지 않음)
-    const masks = [];
+  if (n <= (MAX_EXHAUSTIVE[k] || 0)) {
+    // 모든 조합 계산 (팀 이름만 바뀐 같은 조합은 한 번만 계산)
+    const codes = [];
     const costs = [];
-    const limit = 1 << n;
-    let m = (1 << sizeA) - 1;
+    const sizes = new Int32Array(k);
     let best = Infinity;
-    while (m < limit) {
-      if (n % 2 === 1 || (m & 1)) {
-        for (let i = 0; i < n; i++) inA[i] = (m >> i) & 1;
+    const rec = (i, used) => {
+      if (i === n) {
         const c = cost();
-        masks.push(m);
+        let code = 0;
+        for (let j = n - 1; j >= 0; j--) code = code * k + assign[j];
+        codes.push(code);
         costs.push(c);
         if (c < best) best = c;
+        return;
       }
-      // 같은 인원 수를 유지하면서 다음 조합으로 이동
-      const low = m & -m;
-      const r = m + low;
-      m = (((r ^ m) >> 2) / low) | r;
-    }
+      let need = 0; // 남은 인원으로 모든 팀을 최소 인원까지 채울 수 있는지 확인
+      for (let t = 0; t < k; t++) need += Math.max(0, minSize - sizes[t]);
+      if (n - i < need) return;
+      const limit = Math.min(used + 1, k);
+      for (let t = 0; t < limit; t++) {
+        if (sizes[t] >= maxSize) continue;
+        assign[i] = t;
+        sizes[t]++;
+        rec(i + 1, t === used ? used + 1 : used);
+        sizes[t]--;
+      }
+    };
+    rec(0, 0);
     const threshold = nearBest(best);
     const pool = [];
-    for (let k = 0; k < costs.length; k++) if (costs[k] <= threshold) pool.push(masks[k]);
-    const mask = pool[Math.floor(Math.random() * pool.length)];
-    chosen = new Uint8Array(n);
-    for (let i = 0; i < n; i++) chosen[i] = (mask >> i) & 1;
+    for (let j = 0; j < costs.length; j++) if (costs[j] <= threshold) pool.push(codes[j]);
+    let code = pool[Math.floor(Math.random() * pool.length)];
+    chosen = new Int8Array(n);
+    for (let j = 0; j < n; j++) { chosen[j] = code % k; code = Math.floor(code / k); }
   } else {
-    const candidates = []; // { cost, pick: Uint8Array }
     // 인원이 아주 많으면: 무작위로 나눈 뒤 선수를 한 명씩 맞바꾸며 개선하는 방식
     const order = [...Array(n).keys()];
-    for (let t = 0; t < 150; t++) {
+    const candidates = [];
+    for (let t = 0; t < 120; t++) {
       for (let i = n - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [order[i], order[j]] = [order[j], order[i]];
       }
-      inA.fill(0);
-      for (let k = 0; k < sizeA; k++) inA[order[k]] = 1;
+      order.forEach((playerIdx, idx) => { assign[playerIdx] = idx % k; });
       let current = cost();
       let improved = true;
       while (improved) {
         improved = false;
         for (let i = 0; i < n && !improved; i++) {
-          if (!inA[i]) continue;
-          for (let j = 0; j < n; j++) {
-            if (inA[j]) continue;
-            inA[i] = 0; inA[j] = 1;
+          for (let j = i + 1; j < n; j++) {
+            if (assign[i] === assign[j]) continue;
+            const ti = assign[i];
+            assign[i] = assign[j];
+            assign[j] = ti;
             const c = cost();
             if (c < current - 1e-9) { current = c; improved = true; break; }
-            inA[i] = 1; inA[j] = 0;
+            assign[j] = assign[i];
+            assign[i] = ti;
           }
         }
       }
-      candidates.push({ cost: current, pick: Uint8Array.from(inA) });
+      candidates.push({ cost: current, pick: Int8Array.from(assign) });
     }
     let best = Infinity;
     for (const c of candidates) if (c.cost < best) best = c.cost;
@@ -402,11 +514,256 @@ function generateTeams(attendeePlayers) {
     chosen = pool[Math.floor(Math.random() * pool.length)].pick;
   }
 
-  let A = [];
-  let B = [];
-  attendeePlayers.forEach((p, i) => (chosen[i] ? A : B).push(p.id));
-  if (Math.random() < 0.5) [A, B] = [B, A];
-  return { A, B };
+  // 팀 이름(A, B, C)도 무작위로 붙이기
+  const labels = TEAM_LABELS.slice(0, k);
+  for (let i = labels.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [labels[i], labels[j]] = [labels[j], labels[i]];
+  }
+  const teams = {};
+  TEAM_LABELS.slice(0, k).forEach((l) => { teams[l] = []; });
+  attendeePlayers.forEach((p, i) => teams[labels[chosen[i]]].push(p.id));
+  return teams;
+}
+
+// 경기 기록 한 건을 선수들에게 반영 (승패, Rating, 개인 기록). 여러 판이면 한 번에 반영
+// basis: 기록을 수정할 때 처음 계산했던 예상 승률과 K값을 그대로 쓰기 위한 값 (같은 팀원일 때)
+function applyRecord(nextPlayers, record, basis = null) {
+  const { sideA, sideB, games, winsA, winsB, fromTeams, id: recordId, date } = record;
+  const expectA = basis && typeof basis.expectA === 'number'
+    ? basis.expectA
+    : expectedWinA(teamAverageElo(sideA.members, nextPlayers), teamAverageElo(sideB.members, nextPlayers));
+  const deltas = [];
+  const apply = (ids, myLabel, oppLabel, myWins, myLosses, expected) => {
+    ids.forEach((id) => {
+      const pl = nextPlayers[id];
+      if (!pl) return;
+      const k = basis?.kByPlayer?.[id] ?? (gamesPlayed(pl) < ELO_NEW_GAMES ? ELO_K_NEW : ELO_K);
+      const eloDelta = Math.round(k * (myWins - games * expected) * 10) / 10;
+      nextPlayers[id] = {
+        ...pl,
+        wins: (pl.wins || 0) + myWins,
+        losses: (pl.losses || 0) + myLosses,
+        elo: eloOf(pl) + eloDelta,
+        history: [...(pl.history || []), { kind: 'record', recordId, date, team: myLabel, opponent: oppLabel, wins: myWins, losses: myLosses, eloDelta, k, manual: !fromTeams }],
+      };
+      deltas.push({ playerId: id, winsDelta: myWins, lossesDelta: myLosses, predictionScoreDelta: 0, eloDelta });
+    });
+  };
+  apply(sideA.members, sideA.label, sideB.label, winsA, winsB, expectA);
+  apply(sideB.members, sideB.label, sideA.label, winsB, winsA, 1 - expectA);
+  return { deltas, expectA };
+}
+
+// 참가 인원 구성을 하나의 문자열로 (순서 무관)
+function attendanceKey(ids) {
+  return [...ids].sort().join(',');
+}
+
+// 팀 나누기 기억장치: 한 번 나눈 인원 구성에는 항상 그때 나눈 팀을 그대로 씀
+// (참가 취소 후 다시 신청해서 팀을 새로 뽑는 꼼수 방지)
+// 지금 화면의 팀을 그 팀의 인원 구성으로 저장해두고, 갱신된 기억장치를 돌려줌
+function rememberCurrentTeams(day) {
+  const cache = { ...(day.teamCache || {}) };
+  if (day.teams) {
+    const ids = TEAM_LABELS.flatMap((l) => day.teams[l] || []);
+    const key = attendanceKey(ids);
+    cache[key] = { ...(cache[key] || {}), teams: day.teams, teamsBy: day.teamsBy || null, teamsAt: day.teamsAt || null, predictions: day.predictions || {} };
+  }
+  return cache;
+}
+
+function sameMembers(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  const x = [...a].sort();
+  const y = [...b].sort();
+  return x.every((v, i) => v === y[i]);
+}
+
+// 경기 기록 한 건이 선수들에게 반영된 것을 개인 기록 기준으로 정확히 되돌림 (수정된 기록도 현재 내용 그대로 되돌려짐)
+function revertRecord(nextPlayers, recordId) {
+  Object.keys(nextPlayers).forEach((id) => {
+    const pl = nextPlayers[id];
+    const entries = (pl.history || []).filter((h) => h.recordId === recordId);
+    if (!entries.length) return;
+    const sum = (f) => entries.reduce((a, h) => a + (h[f] || 0), 0);
+    nextPlayers[id] = {
+      ...pl,
+      wins: (pl.wins || 0) - sum('wins'),
+      losses: (pl.losses || 0) - sum('losses'),
+      elo: eloOf(pl) - sum('eloDelta'),
+      history: pl.history.filter((h) => h.recordId !== recordId),
+    };
+  });
+}
+
+// ============================================================
+// 랭킹 이미지 만들기 (캔버스에 직접 그려서 PNG로)
+// ============================================================
+const RANK_TITLES = { winrate: '승률 랭킹', prediction: '적중률 랭킹', skill: 'Rating 랭킹' };
+const POSITION_PILL = {
+  '포인트가드': ['#dbeafe', '#1d4ed8'],
+  '슈팅가드': ['#e0f2fe', '#0369a1'],
+  '스몰포워드': ['#fef3c7', '#b45309'],
+  '파워포워드': ['#ffedd5', '#c2410c'],
+  '센터': ['#e2e8f0', '#334155'],
+};
+const MEDAL_COLORS = ['#f59e0b', '#94a3b8', '#b45309'];
+
+function fillRoundRect(ctx, x, y, w, h, r, color) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function drawBall(ctx, cx, cy, r) {
+  ctx.save();
+  ctx.fillStyle = '#f97316';
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#0f172a'; ctx.lineWidth = r * 0.09; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r); ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy); ctx.stroke();
+  const k = r * 0.707;
+  ctx.beginPath(); ctx.moveTo(cx - k, cy - k); ctx.quadraticCurveTo(cx - r * 0.25, cy, cx - k, cy + k); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx + k, cy - k); ctx.quadraticCurveTo(cx + r * 0.25, cy, cx + k, cy + k); ctx.stroke();
+  ctx.restore();
+}
+
+function fitText(ctx, text, maxWidth) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let t = text;
+  while (t.length > 1 && ctx.measureText(t + '…').width > maxWidth) t = t.slice(0, -1);
+  return t + '…';
+}
+
+async function renderRankingImage({ clubName, title, lines, rows, unrankedLabel }) {
+  const FONT = '"Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif';
+  const DISPLAY = `"Black Han Sans", ${FONT}`;
+  try {
+    await Promise.all([
+      document.fonts.load(`700 34px ${FONT}`),
+      document.fonts.load(`400 24px ${FONT}`),
+      document.fonts.load(`48px ${DISPLAY}`),
+    ]);
+  } catch (e) { /* 기본 글꼴로 그림 */ }
+
+  const W = 1080;
+  const ROW_H = 104;
+  const CARD_X = 40;
+  const CARD_W = W - CARD_X * 2;
+  const L = CARD_X + 28;
+  const R = W - CARD_X - 28;
+  const HEADER_H = 326 + Math.max(0, lines.length - 2) * 34;
+  const ranked = rows.filter((r) => r.ranked);
+  const unranked = rows.filter((r) => !r.ranked);
+  const rankedRows = Math.max(ranked.length, 1);
+  const rankedCardH = rankedRows * ROW_H + 16;
+  const unrankedBlockH = unranked.length ? 70 + unranked.length * ROW_H + 16 : 0;
+  const FOOTER_H = 44;
+  const H = HEADER_H + 36 + rankedCardH + unrankedBlockH + FOOTER_H;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.textBaseline = 'alphabetic';
+
+  // 배경과 머리말
+  ctx.fillStyle = '#f1f5f9'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, W, HEADER_H);
+  fillRoundRect(ctx, L - 8, 52, 76, 76, 20, '#ea580c');
+  drawBall(ctx, L + 30, 90, 26);
+  ctx.fillStyle = '#ffffff'; ctx.font = `44px ${DISPLAY}`; ctx.textAlign = 'left';
+  ctx.fillText(clubName, L + 92, 106);
+  ctx.fillStyle = '#fb923c'; ctx.font = `64px ${DISPLAY}`;
+  ctx.fillText(title, L - 6, 208);
+  ctx.fillStyle = '#94a3b8'; ctx.font = `500 25px ${FONT}`;
+  lines.forEach((line, i) => ctx.fillText(fitText(ctx, line, R - L), L - 4, 252 + i * 34));
+
+  const drawRow = (row, y) => {
+    const cy = y + ROW_H / 2;
+    const medal = row.ranked && row.rank <= 3 ? MEDAL_COLORS[row.rank - 1] : null;
+    // 순위
+    ctx.textAlign = 'center';
+    ctx.font = `40px ${DISPLAY}`;
+    ctx.fillStyle = medal || (row.ranked ? '#cbd5e1' : '#e2e8f0');
+    ctx.fillText(row.ranked ? String(row.rank) : (row.groupRank ? String(row.groupRank) : '-'), L + 22, cy + 14);
+    // 이름 첫 글자
+    ctx.beginPath(); ctx.arc(L + 92, cy, 30, 0, Math.PI * 2);
+    ctx.fillStyle = medal || (row.ranked ? '#334155' : '#cbd5e1'); ctx.fill();
+    ctx.fillStyle = '#ffffff'; ctx.font = `700 26px ${FONT}`;
+    ctx.fillText((row.name || '?').slice(0, 1), L + 92, cy + 9);
+    // 점수
+    ctx.textAlign = 'right';
+    ctx.font = `800 36px ${FONT}`;
+    ctx.fillStyle = row.ranked ? '#0f172a' : '#cbd5e1';
+    ctx.fillText(row.scoreLabel, R - 8, cy + 13);
+    const scoreW = ctx.measureText(row.scoreLabel).width;
+    // 이름 + 포지션
+    const nameX = L + 140;
+    const maxText = R - 8 - scoreW - 32 - nameX;
+    ctx.textAlign = 'left';
+    ctx.font = `700 32px ${FONT}`;
+    ctx.fillStyle = '#1e293b';
+    const pos = normalizePosition(row.position);
+    const pill = POSITION_ABBR[pos] || '';
+    ctx.font = `800 20px ${FONT}`;
+    const pillW = pill ? ctx.measureText(pill).width + 24 : 0;
+    ctx.font = `700 32px ${FONT}`;
+    const name = fitText(ctx, row.name || '?', maxText - pillW - 14);
+    ctx.fillText(name, nameX, cy - 6);
+    if (pill) {
+      const nameW = ctx.measureText(name).width;
+      const [bg, fg] = POSITION_PILL[pos] || ['#f1f5f9', '#475569'];
+      fillRoundRect(ctx, nameX + nameW + 14, cy - 36, pillW, 34, 8, bg);
+      ctx.fillStyle = fg; ctx.font = `800 20px ${FONT}`; ctx.textAlign = 'center';
+      ctx.fillText(pill, nameX + nameW + 14 + pillW / 2, cy - 12);
+      ctx.textAlign = 'left';
+    }
+    ctx.fillStyle = '#64748b'; ctx.font = `400 23px ${FONT}`;
+    ctx.fillText(fitText(ctx, row.detail || '', maxText), nameX, cy + 30);
+  };
+
+  // 순위에 든 사람
+  let y = HEADER_H + 36;
+  fillRoundRect(ctx, CARD_X, y, CARD_W, rankedCardH, 28, '#ffffff');
+  y += 8;
+  if (!ranked.length) {
+    ctx.fillStyle = '#94a3b8'; ctx.font = `500 26px ${FONT}`; ctx.textAlign = 'center';
+    ctx.fillText('아직 순위에 든 사람이 없어요', W / 2, y + ROW_H / 2 + 9);
+    y += ROW_H;
+  }
+  ranked.forEach((row, i) => {
+    drawRow(row, y);
+    if (i < ranked.length - 1) { ctx.fillStyle = '#f1f5f9'; ctx.fillRect(L, y + ROW_H - 1, R - L, 2); }
+    y += ROW_H;
+  });
+  y += 8;
+
+  // 아직 순위에 들지 못한 사람
+  if (unranked.length) {
+    y += 22;
+    ctx.fillStyle = '#64748b'; ctx.font = `700 24px ${FONT}`; ctx.textAlign = 'left';
+    ctx.fillText(unrankedLabel, CARD_X + 8, y + 26);
+    y += 48;
+    fillRoundRect(ctx, CARD_X, y, CARD_W, unranked.length * ROW_H + 16, 28, '#ffffff');
+    y += 8;
+    unranked.forEach((row, i) => {
+      drawRow(row, y);
+      if (i < unranked.length - 1) { ctx.fillStyle = '#f1f5f9'; ctx.fillRect(L, y + ROW_H - 1, R - L, 2); }
+      y += ROW_H;
+    });
+    y += 8;
+  }
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('이미지를 만들지 못했어요'))), 'image/png');
+  });
 }
 
 // 팀 배정 결과 화면에 보여줄 팀별 요약
@@ -416,9 +773,7 @@ function teamSummary(ids, playerMap) {
   return {
     avgHeight: heights.length ? Math.round(heights.reduce((a, b) => a + b, 0) / heights.length) : null,
     maxHeight: heights.length ? Math.max(...heights) : null,
-    centers: list.filter((p) => p.position === '센터').length,
-    forwards: list.filter((p) => p.position === '포워드').length,
-    guards: list.filter((p) => p.position === '가드').length,
+    count: Object.fromEntries(POSITIONS.map((pos) => [pos, list.filter((p) => normalizePosition(p.position) === pos).length])),
     avgElo: list.length ? Math.round(teamAverageElo(ids, playerMap)) : null,
   };
 }
@@ -435,15 +790,18 @@ function Spinner({ size = 16, dark = false }) {
 }
 
 const POSITION_STYLE = {
-  '가드': 'bg-blue-100 text-blue-700',
-  '포워드': 'bg-orange-100 text-orange-700',
+  '포인트가드': 'bg-blue-100 text-blue-700',
+  '슈팅가드': 'bg-sky-100 text-sky-700',
+  '스몰포워드': 'bg-amber-100 text-amber-700',
+  '파워포워드': 'bg-orange-100 text-orange-700',
   '센터': 'bg-slate-200 text-slate-700',
 };
 
 function PositionBadge({ position }) {
+  const pos = normalizePosition(position);
   return (
-    <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${POSITION_STYLE[position] || 'bg-gray-100 text-gray-700'}`}>
-      {position}
+    <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${POSITION_STYLE[pos] || 'bg-gray-100 text-gray-700'}`}>
+      {POSITION_ABBR[pos] || pos}
     </span>
   );
 }
@@ -473,7 +831,12 @@ function PlayerRow({ player, tone }) {
 // 메인 앱
 // ============================================================
 function BasketballClubApp() {
-  const [dateKey] = useState(() => todayKey());
+  const [dateKey] = useState(() => todayKey());          // 오늘
+  const [viewDate, setViewDate] = useState(() => todayKey()); // 지금 보고 있는 날 (지난 경기 사후입력용)
+  const [now, setNow] = useState(() => new Date());
+  const [editLock, setEditLock] = useState(null);         // 경기 결과 입력 잠금 { by, name, at }
+  const [editingRecordId, setEditingRecordId] = useState(null);
+  const [lockNotice, setLockNotice] = useState('');
   const [loading, setLoading] = useState(true);
   const [players, setPlayers] = useState({});
   const [daily, setDaily] = useState({ attendance: {}, teams: null, predictions: {}, result: null });
@@ -492,13 +855,28 @@ function BasketballClubApp() {
   const [regHeight, setRegHeight] = useState('');
   const [regPosition, setRegPosition] = useState(POSITIONS[0]);
   const [heightDraft, setHeightDraft] = useState(null);
+  const [memberDrafts, setMemberDrafts] = useState({}); // 관리자 회원 관리: { 사번: { position, height } }
+  const [memberSearch, setMemberSearch] = useState('');
+  const [memberMsg, setMemberMsg] = useState('');
   const [regPassword, setRegPassword] = useState('');
   const [regPasswordConfirm, setRegPasswordConfirm] = useState('');
 
-  const [confirmingWinner, setConfirmingWinner] = useState(null);
+  const [teamCountChoice, setTeamCountChoice] = useState(null); // null이면 인원 기준 자동
+  const [showTeamHistory, setShowTeamHistory] = useState(false);
+  const [showRecordForm, setShowRecordForm] = useState(false);
+  const [recMode, setRecMode] = useState('teams');   // teams: 오늘 팀끼리 / custom: 직접 구성
+  const [recPair, setRecPair] = useState(['A', 'B']);
+  const [recAssign, setRecAssign] = useState({});     // 직접 구성: { 사번: 1 | 2 }
+  const [recShowAll, setRecShowAll] = useState(false);
+  const [recGames, setRecGames] = useState(1);
+  const [recWinsA, setRecWinsA] = useState(null);     // 팀1(왼쪽)의 승수
+  const [confirmingRecord, setConfirmingRecord] = useState(false);
+  const [confirmingClose, setConfirmingClose] = useState(false);
   const [showAdminClaim, setShowAdminClaim] = useState(false);
   const [adminCodeInput, setAdminCodeInput] = useState('');
   const [rankMode, setRankMode] = useState('winrate');
+  const [rankImage, setRankImage] = useState(null);   // { url, blob, fileName }
+  const [rankImageBusy, setRankImageBusy] = useState(false);
 
   const [showChangePassword, setShowChangePassword] = useState(false);
   const [curPassword, setCurPassword] = useState('');
@@ -524,7 +902,7 @@ function BasketballClubApp() {
         const pRes = await api.get('players').catch(() => null);
         const dRes = await api.get(`daily:${dateKey}`).catch(() => null);
         const lRes = await api.get('updateLog').catch(() => null);
-        const p = pRes ? JSON.parse(pRes.value) : {};
+        const p = pRes ? parsePlayers(pRes) : {};
         setPlayers(p);
         setDaily(dRes ? JSON.parse(dRes.value) : { attendance: {}, teams: null, predictions: {}, result: null });
         setLogs(lRes ? JSON.parse(lRes.value) : []);
@@ -543,25 +921,60 @@ function BasketballClubApp() {
     const id = setInterval(async () => {
       try {
         const pRes = await api.get('players').catch(() => null);
-        const dRes = await api.get(`daily:${dateKey}`).catch(() => null);
-        const lRes = await api.get('updateLog').catch(() => null);
-        if (pRes) setPlayers(JSON.parse(pRes.value));
+        const dRes = await api.get(`daily:${viewDate}`).catch(() => null);
+        if (pRes) setPlayers(parsePlayers(pRes));
         if (dRes) setDaily(JSON.parse(dRes.value));
-        if (lRes) setLogs(JSON.parse(lRes.value));
+        if (tab === 'today') {
+          const kRes = await api.get(`editLock:${viewDate}`).catch(() => undefined);
+          if (kRes !== undefined) setEditLock(kRes ? JSON.parse(kRes.value) : null);
+        }
+        if (tab === 'admin') {
+          const lRes = await api.get('updateLog').catch(() => null);
+          if (lRes) setLogs(JSON.parse(lRes.value));
+        }
       } catch (e) { /* silent */ }
     }, 8000);
     return () => clearInterval(id);
-  }, [dateKey, apiConfigured]);
+  }, [viewDate, apiConfigured, tab]);
+
+  // 시계: 참가신청, 예측 마감 시간 확인용. 날짜가 바뀌면 새 날로 다시 불러오기
+  useEffect(() => {
+    const id = setInterval(() => {
+      setNow(new Date());
+      if (todayKey() !== dateKey) window.location.reload();
+    }, 20000);
+    return () => clearInterval(id);
+  }, [dateKey]);
+
+  // 경기 결과 입력 중에는 잠금을 계속 살려둠 (창을 닫으면 3분 뒤 자동으로 풀림)
+  useEffect(() => {
+    if (!showRecordForm || !apiConfigured) return undefined;
+    const key = `editLock:${viewDate}`;
+    const id = setInterval(async () => {
+      try {
+        const r = await api.get(key).catch(() => null);
+        const current = r ? JSON.parse(r.value) : null;
+        if (current && current.by === currentPlayerId) {
+          const mine = { ...current, at: new Date().toISOString() };
+          await apiSetWithRetry(key, JSON.stringify(mine));
+          setEditLock(mine);
+        }
+      } catch (e) { /* silent */ }
+    }, EDIT_LOCK_HEARTBEAT_MS);
+    return () => clearInterval(id);
+  }, [showRecordForm, viewDate, currentPlayerId, apiConfigured]);
 
   const manualRefresh = async () => {
     setBusy(true);
     try {
       const pRes = await api.get('players').catch(() => null);
-      const dRes = await api.get(`daily:${dateKey}`).catch(() => null);
+      const dRes = await api.get(`daily:${viewDate}`).catch(() => null);
       const lRes = await api.get('updateLog').catch(() => null);
-      if (pRes) setPlayers(JSON.parse(pRes.value));
+      const kRes = await api.get(`editLock:${viewDate}`).catch(() => undefined);
+      if (pRes) setPlayers(parsePlayers(pRes));
       if (dRes) setDaily(JSON.parse(dRes.value));
       if (lRes) setLogs(JSON.parse(lRes.value));
+      if (kRes !== undefined) setEditLock(kRes ? JSON.parse(kRes.value) : null);
     } finally {
       setBusy(false);
     }
@@ -573,7 +986,7 @@ function BasketballClubApp() {
   };
   const saveDaily = async (next) => {
     setDaily(next);
-    await apiSetWithRetry(`daily:${dateKey}`, JSON.stringify(next));
+    await apiSetWithRetry(`daily:${viewDate}`, JSON.stringify(next));
   };
   const saveLogs = async (next) => {
     setLogs(next);
@@ -592,7 +1005,7 @@ function BasketballClubApp() {
     setBusy(true);
     try {
       const pRes = await api.get('players').catch(() => null);
-      const fresh = pRes ? JSON.parse(pRes.value) : {};
+      const fresh = pRes ? parsePlayers(pRes) : {};
       if (fresh[empId]) { setError('이미 등록된 사번입니다. 로그인해주세요.'); return; }
       const { hash, method } = await hashPassword(regPassword);
       const newPlayer = {
@@ -620,7 +1033,7 @@ function BasketballClubApp() {
     setBusy(true);
     try {
       const pRes = await api.get('players').catch(() => null);
-      const fresh = pRes ? JSON.parse(pRes.value) : {};
+      const fresh = pRes ? parsePlayers(pRes) : {};
       setPlayers(fresh);
       const player = fresh[empId];
       if (!player) { setError('등록되지 않은 사번입니다. 회원가입을 먼저 해주세요.'); return; }
@@ -648,15 +1061,116 @@ function BasketballClubApp() {
   const attendeePlayers = attendeeIds.map((id) => players[id]).filter(Boolean);
   const iAttend = currentPlayerId ? !!daily.attendance?.[currentPlayerId] : false;
 
-  const sortedHistory = [...(me?.history || [])].sort((a, b) => (a.date < b.date ? 1 : -1));
+  // 내 기록: 최신 날짜가 위로, 같은 날은 나중에 입력한 기록이 위로
+  const sortedHistory = [...(me?.history || [])].reverse().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 
-  const handleToggleAttendance = async () => {
-    if (daily.result?.finalized) return;
+  // 오늘 경기 상태
+  const teamLabels = daily.teams ? TEAM_LABELS.filter((l) => Array.isArray(daily.teams[l]) && daily.teams[l].length) : [];
+  const records = daily.records || [];
+  const teamRecords = records.filter((r) => r.fromTeams);
+  const legacyFinal = !!daily.result?.finalized; // 예전 방식(1경기 승패)으로 마감된 날
+  const dayClosed = !!daily.predictionResult?.finalized || legacyFinal;
+  const isToday = viewDate === dateKey;
+  const nowMin = minutesOfDay(now);
+  const signupOpen = isToday && nowMin >= SIGNUP_OPEN_MIN && nowMin < SIGNUP_CLOSE_MIN && !dayClosed;
+  const predictionTimeOver = !isToday || nowMin >= PREDICTION_CLOSE_MIN;
+  // 결과예측은 12:30에 마감. 그 전에 오늘 팀끼리 첫 경기가 기록돼도 바로 마감 (지난 날은 예측 불가)
+  const predictionLocked = dayClosed || predictionTimeOver || teamRecords.length > 0;
+
+  // 팀 나누기: 아직 팀이 없거나, 팀을 나눈 뒤 참가인원이 바뀌었을 때만 가능 (누구나)
+  const teamMemberIds = teamLabels.flatMap((l) => daily.teams[l]);
+  const attendanceChanged = !daily.teams || !sameMembers(attendeePlayers.map((p) => p.id), teamMemberIds);
+  // 지금 인원 구성으로 예전에 나눈 팀이 있으면, 다시 나누기는 그 팀으로 되돌리기만 함
+  const cachedForCurrent = !!daily.teamCache?.[attendanceKey(attendeePlayers.map((p) => p.id))];
+  const more = moreNeeded(attendeePlayers.length);
+  const myName = me?.name || currentPlayerId;
+  const lockedByOther = lockActive(editLock) && editLock.by !== currentPlayerId;
+  const standings = Object.fromEntries(teamLabels.map((l) => [l, 0]));
+  teamRecords.forEach((r) => {
+    if (r.sideA.label in standings) standings[r.sideA.label] += r.winsA;
+    if (r.sideB.label in standings) standings[r.sideB.label] += r.winsB;
+  });
+  const topWins = teamLabels.length ? Math.max(...teamLabels.map((l) => standings[l])) : 0;
+  const leaders = teamLabels.filter((l) => standings[l] === topWins);
+  const autoTeamCount = defaultTeamCount(attendeePlayers.length);
+  const teamCount = teamCountChoice || autoTeamCount;
+  const canGenerateTeams = isToday && !dayClosed && attendanceChanged && teamRecords.length === 0 && (cachedForCurrent || attendeePlayers.length >= teamCount * 2);
+  const teamPairs = [];
+  teamLabels.forEach((a, i) => teamLabels.slice(i + 1).forEach((b) => teamPairs.push([a, b])));
+  const activePair = teamPairs.find(([a, b]) => a === recPair[0] && b === recPair[1]) || teamPairs[0] || null;
+
+  const emptyDaily = () => ({ attendance: {}, teams: null, predictions: {}, records: [] });
+
+  const loadFreshDaily = async (date = viewDate) => {
+    const dRes = await api.get(`daily:${date}`).catch(() => null);
+    return dRes ? JSON.parse(dRes.value) : emptyDaily();
+  };
+
+  const loadFreshPlayers = async () => {
+    const pRes = await api.get('players').catch(() => null);
+    return pRes ? parsePlayers(pRes) : players;
+  };
+
+  const loadFreshLogs = async () => {
+    const lRes = await api.get('updateLog').catch(() => null);
+    return lRes ? JSON.parse(lRes.value) : logs;
+  };
+
+  // 지난 날짜로 이동 (경기 결과 사후입력)
+  const goToDate = async (date) => {
+    if (!date || date > dateKey || date === viewDate) return;
+    setError('');
+    setLockNotice('');
+    setConfirmingClose(false);
+    if (showRecordForm) await closeRecordForm();
     setBusy(true);
     try {
-      const next = { ...(daily.attendance || {}) };
-      if (next[currentPlayerId]) delete next[currentPlayerId]; else next[currentPlayerId] = true;
-      await saveDaily({ ...daily, attendance: next });
+      const dRes = await api.get(`daily:${date}`).catch(() => null);
+      const kRes = await api.get(`editLock:${date}`).catch(() => null);
+      setDaily(dRes ? JSON.parse(dRes.value) : emptyDaily());
+      setEditLock(kRes ? JSON.parse(kRes.value) : null);
+      setViewDate(date);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleToggleAttendance = async () => {
+    if (!isToday) return;
+    const m = minutesOfDay(new Date());
+    if (dayClosed || m < SIGNUP_OPEN_MIN || m >= SIGNUP_CLOSE_MIN) {
+      setError('참가신청은 오전 5시부터 11시 45분까지만 할 수 있어요.');
+      return;
+    }
+    setBusy(true);
+    try {
+      // 여러 명이 동시에 누를 수 있으니 최신 출석부에 반영
+      const fresh = await loadFreshDaily();
+      const next = { ...(fresh.attendance || {}) };
+      const joining = !next[currentPlayerId];
+      if (joining) next[currentPlayerId] = true; else delete next[currentPlayerId];
+      let update = { ...fresh, attendance: next };
+
+      // 예전에 팀을 나눴던 인원 구성으로 돌아가면, 그때 팀과 예측을 그대로 되살림
+      if (fresh.teams && !(fresh.records || []).some((r) => r.fromTeams)) {
+        const newIds = Object.keys(next).filter((id) => next[id] && players[id]);
+        const newKey = attendanceKey(newIds);
+        const curIds = TEAM_LABELS.flatMap((l) => fresh.teams[l] || []);
+        if (newKey !== attendanceKey(curIds) && fresh.teamCache?.[newKey]) {
+          const cache = rememberCurrentTeams(fresh);
+          const saved = cache[newKey];
+          update = {
+            ...update,
+            teams: saved.teams, teamsBy: saved.teamsBy, teamsAt: saved.teamsAt, predictions: saved.predictions || {},
+            teamCache: cache,
+            teamHistory: [...(fresh.teamHistory || []), {
+              at: new Date().toISOString(), by: myName, size: newIds.length, teamCount: Object.keys(saved.teams).length,
+              added: joining ? [myName] : [], removed: joining ? [] : [myName], restored: true, auto: true,
+            }],
+          };
+        }
+      }
+      await saveDaily(update);
     } catch (e) {
       setError(`출석 처리 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
     } finally {
@@ -665,12 +1179,59 @@ function BasketballClubApp() {
   };
 
   const handleGenerateTeams = async () => {
-    if (attendeePlayers.length < 2) { setError('팀을 나누려면 최소 2명 이상 참석해야 해요.'); return; }
     setError('');
     setBusy(true);
     try {
-      const teams = generateTeams(attendeePlayers);
-      await saveDaily({ ...daily, teams, predictions: {}, result: null });
+      if (!isToday) return;
+      const fresh = await loadFreshDaily();
+      if ((fresh.records || []).some((r) => r.fromTeams)) {
+        setError('이미 오늘 팀으로 기록된 경기가 있어서 다시 나눌 수 없어요. 관리자 탭에서 기록을 먼저 취소해주세요.');
+        return;
+      }
+      const attendees = Object.keys(fresh.attendance || {}).filter((id) => fresh.attendance[id]).map((id) => players[id]).filter(Boolean);
+      // 이미 나눈 팀은 참가인원이 바뀌었을 때만 다시 나눌 수 있음 (방금 다른 사람이 나눴을 수도 있어서 최신 기준으로 확인)
+      const freshTeamIds = fresh.teams ? TEAM_LABELS.flatMap((l) => fresh.teams[l] || []) : [];
+      if (fresh.teams && sameMembers(attendees.map((p) => p.id), freshTeamIds)) {
+        setDaily(fresh);
+        setError('참가인원이 바뀌지 않아서 팀을 다시 나눌 수 없어요.');
+        return;
+      }
+      const attendeeIds = attendees.map((p) => p.id);
+      const key = attendanceKey(attendeeIds);
+      const cache = rememberCurrentTeams(fresh);
+      const nowIso = new Date().toISOString();
+      const nameOf = (id) => players[id]?.name || id;
+      let teams;
+      let teamsBy;
+      let teamsAt;
+      let predictions;
+      let restored = false;
+      if (cache[key]) {
+        // 이 인원 구성으로 나눈 적이 있으면 그때 팀을 그대로 (다시 뽑기 불가)
+        ({ teams, teamsBy, teamsAt } = cache[key]);
+        predictions = cache[key].predictions || {};
+        restored = true;
+      } else {
+        const count = Math.min(teamCount, 4);
+        if (attendees.length < count * 2) { setError(`${count}팀으로 나누려면 최소 ${count * 2}명이 참석해야 해요.`); return; }
+        teams = generateTeams(attendees, count);
+        teamsBy = myName;
+        teamsAt = nowIso;
+        predictions = {};
+        cache[key] = { teams, teamsBy, teamsAt, predictions };
+      }
+      const historyEntry = {
+        at: nowIso, by: myName, size: attendees.length, teamCount: Object.keys(teams).length,
+        added: attendeeIds.filter((id) => !freshTeamIds.includes(id)).map(nameOf),
+        removed: freshTeamIds.filter((id) => !attendeeIds.includes(id)).map(nameOf),
+        restored, auto: false,
+      };
+      await saveDaily({
+        ...fresh, teams, teamsBy, teamsAt, predictions, teamCache: cache,
+        teamHistory: [...(fresh.teamHistory || []), historyEntry],
+      });
+      setTeamCountChoice(null);
+      setRecPair(['A', 'B']);
     } catch (e) {
       setError(`팀 나누기 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
     } finally {
@@ -679,11 +1240,13 @@ function BasketballClubApp() {
   };
 
   const handlePredict = async (team) => {
-    if (!daily.teams || daily.result?.finalized) return;
+    if (!isToday || predictionLocked || minutesOfDay(new Date()) >= PREDICTION_CLOSE_MIN) return;
     setBusy(true);
     try {
-      const next = { ...(daily.predictions || {}), [currentPlayerId]: team };
-      await saveDaily({ ...daily, predictions: next });
+      const fresh = await loadFreshDaily();
+      if (fresh.predictionResult?.finalized || (fresh.records || []).some((r) => r.fromTeams)) return;
+      const next = { ...(fresh.predictions || {}), [currentPlayerId]: team };
+      await saveDaily({ ...fresh, predictions: next });
     } catch (e) {
       setError(`예측 저장 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
     } finally {
@@ -691,110 +1254,334 @@ function BasketballClubApp() {
     }
   };
 
-  const handleSubmitResult = async (winner) => {
-    if (!daily.teams || daily.result?.finalized) return;
+  // ----- 경기 결과 입력 폼 -----
+  const recSides = () => {
+    if (recMode === 'teams') {
+      if (!activePair || !daily.teams) return null;
+      const [a, b] = activePair;
+      return { sideA: { label: a, members: daily.teams[a] }, sideB: { label: b, members: daily.teams[b] }, fromTeams: true };
+    }
+    const m1 = Object.keys(recAssign).filter((id) => recAssign[id] === 1 && players[id]);
+    const m2 = Object.keys(recAssign).filter((id) => recAssign[id] === 2 && players[id]);
+    return { sideA: { label: '팀1', members: m1 }, sideB: { label: '팀2', members: m2 }, fromTeams: false };
+  };
+
+  const changeRecGames = (delta) => {
+    const g = Math.min(20, Math.max(1, recGames + delta));
+    setRecGames(g);
+    setRecWinsA((w) => (w === null ? null : Math.min(w, g)));
+    setConfirmingRecord(false);
+  };
+
+  const cycleAssign = (id) => {
+    setConfirmingRecord(false);
+    setRecAssign((a) => {
+      const next = { ...a };
+      if (!next[id]) next[id] = 1; else if (next[id] === 1) next[id] = 2; else delete next[id];
+      return next;
+    });
+  };
+
+  const loadTeamInto = (label, side) => {
+    setConfirmingRecord(false);
+    setRecAssign((a) => {
+      const next = {};
+      Object.entries(a).forEach(([id, v]) => { if (v !== side) next[id] = v; });
+      (daily.teams?.[label] || []).forEach((id) => { next[id] = side; });
+      return next;
+    });
+  };
+
+  // ----- 경기 결과 입력 잠금 (한 번에 한 사람만 입력) -----
+  const lockKey = `editLock:${viewDate}`;
+  const readLock = async () => {
+    const r = await api.get(lockKey).catch(() => null);
+    return r ? JSON.parse(r.value) : null;
+  };
+  const acquireLock = async () => {
+    const current = await readLock();
+    if (lockActive(current) && current.by !== currentPlayerId) { setEditLock(current); return false; }
+    const mine = { by: currentPlayerId, name: myName, at: new Date().toISOString() };
+    await apiSetWithRetry(lockKey, JSON.stringify(mine));
+    // 거의 동시에 누른 사람이 있었는지 한 번 더 확인
+    await new Promise((r) => setTimeout(r, 600));
+    const check = await readLock();
+    setEditLock(check);
+    return !!check && check.by === currentPlayerId;
+  };
+  const releaseLock = async () => {
+    const current = await readLock();
+    if (current && current.by === currentPlayerId) await api.delete(lockKey);
+    setEditLock(null);
+  };
+
+  const openRecordForm = async (record = null) => {
+    setError('');
+    setLockNotice('');
+    if (record && record.fromTeams && daily.predictionResult?.finalized) {
+      setError('마감된 날의 오늘 팀끼리 기록은 관리자가 마감을 취소한 뒤에 수정할 수 있어요.');
+      return;
+    }
     setBusy(true);
     try {
-      // 다른 사람이 방금 가입하거나 정보를 바꿨을 수 있으니 최신 데이터로 계산
-      const pRes = await api.get('players').catch(() => null);
-      const freshPlayers = pRes ? JSON.parse(pRes.value) : players;
-
-      const allIds = new Set([...daily.teams.A, ...daily.teams.B, ...Object.keys(daily.predictions || {})]);
-      const nextPlayers = { ...freshPlayers };
-      const deltas = [];
-
-      // 엘로: 경기 전 점수로 예상 승률을 계산하고, 결과와의 차이만큼 점수 조정
-      const eloA = teamAverageElo(daily.teams.A, freshPlayers);
-      const eloB = teamAverageElo(daily.teams.B, freshPlayers);
-      const expectA = expectedWinA(eloA, eloB);
-      const scoreA = winner === 'A' ? 1 : 0;
-
-      allIds.forEach((id) => {
-        if (!nextPlayers[id]) return;
-        const onA = daily.teams.A.includes(id);
-        const onB = daily.teams.B.includes(id);
-        const team = onA ? 'A' : (onB ? 'B' : null);
-        const predicted = daily.predictions?.[id] || null;
-        const won = team ? team === winner : null;
-        const predictionCorrect = predicted ? predicted === winner : null;
-
-        const winsDelta = won === true ? 1 : 0;
-        const lossesDelta = won === false ? 1 : 0;
-        const predictionScoreDelta = predictionCorrect ? 1 : 0;
-
-        let eloDelta = 0;
-        if (team) {
-          const k = gamesPlayed(nextPlayers[id]) < ELO_NEW_GAMES ? ELO_K_NEW : ELO_K;
-          const actual = team === 'A' ? scoreA : 1 - scoreA;
-          const expected = team === 'A' ? expectA : 1 - expectA;
-          eloDelta = Math.round(k * (actual - expected) * 10) / 10;
+      const ok = await acquireLock();
+      if (!ok) { setLockNotice('다른 사람이 입력중입니다.'); return; }
+      if (record) {
+        setEditingRecordId(record.id);
+        setRecGames(record.games);
+        setRecWinsA(record.winsA);
+        if (record.fromTeams) {
+          setRecMode('teams');
+          setRecPair([record.sideA.label, record.sideB.label]);
+        } else {
+          setRecMode('custom');
+          const a = {};
+          record.sideA.members.forEach((id) => { a[id] = 1; });
+          record.sideB.members.forEach((id) => { a[id] = 2; });
+          setRecAssign(a);
         }
-
-        const historyEntry = { date: dateKey, team, result: team ? (won ? 'win' : 'loss') : null, predicted, predictionCorrect, eloDelta: team ? eloDelta : null };
-
-        nextPlayers[id] = {
-          ...nextPlayers[id],
-          wins: (nextPlayers[id].wins || 0) + winsDelta,
-          losses: (nextPlayers[id].losses || 0) + lossesDelta,
-          predictionScore: (nextPlayers[id].predictionScore || 0) + predictionScoreDelta,
-          elo: eloOf(nextPlayers[id]) + eloDelta,
-          history: [...(nextPlayers[id].history || []), historyEntry],
-        };
-        deltas.push({ playerId: id, winsDelta, lossesDelta, predictionScoreDelta, eloDelta });
-      });
-
-      await savePlayers(nextPlayers);
-      const result = { winner, finalized: true, timestamp: new Date().toISOString(), enteredBy: me?.name || currentPlayerId };
-      await saveDaily({ ...daily, result });
-
-      const logEntry = {
-        id: `${dateKey}-${Date.now()}`, date: dateKey, timestamp: new Date().toISOString(),
-        adminName: me?.name || currentPlayerId, winner, playerDeltas: deltas, undone: false,
-      };
-      await saveLogs([logEntry, ...logs]);
-      setConfirmingWinner(null);
+      } else {
+        setEditingRecordId(null);
+        setRecGames(1);
+        setRecWinsA(null);
+        setRecMode(teamLabels.length >= 2 && !dayClosed ? 'teams' : 'custom');
+      }
+      setConfirmingRecord(false);
+      setShowRecordForm(true);
     } catch (e) {
-      setError(`결과 입력 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
+      setError(`입력 화면을 여는 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
     } finally {
       setBusy(false);
     }
   };
 
-  const handleUndo = async (logId) => {
+  const closeRecordForm = async () => {
+    setShowRecordForm(false);
+    setConfirmingRecord(false);
+    setEditingRecordId(null);
+    try { await releaseLock(); } catch (e) { /* 3분 뒤 자동으로 풀림 */ }
+  };
+
+  const askSaveRecord = () => {
+    setError('');
+    const sides = recSides();
+    if (!sides) { setError('맞붙을 두 팀을 골라주세요.'); return; }
+    if (!sides.sideA.members.length || !sides.sideB.members.length) { setError('두 팀에 각각 1명 이상 넣어주세요.'); return; }
+    if (recWinsA === null) { setError('승패를 입력해주세요.'); return; }
+    setConfirmingRecord(true);
+  };
+
+  // 기록 추가 또는 수정의 실제 저장 (잠금은 부르는 쪽에서 잡고 풀어요)
+  const saveRecordCore = async ({ editingId, sideA, sideB, games, winsA, fromTeams }) => {
+    const freshDaily = await loadFreshDaily();
+    const existing = editingId ? (freshDaily.records || []).find((r) => r.id === editingId) : null;
+    if (editingId && !existing) throw new Error('이 기록은 이미 삭제됐어요');
+    if (freshDaily.predictionResult?.finalized && (fromTeams || existing?.fromTeams)) {
+      throw new Error('마감된 날에는 오늘 팀끼리 기록을 추가하거나 수정할 수 없어요. 직접 구성으로 입력해주세요');
+    }
+    const freshPlayers = await loadFreshPlayers();
+    const nextPlayers = { ...freshPlayers };
+    const nowIso = new Date().toISOString();
+    const recordId = existing ? existing.id : uniqueId(`rec-${viewDate}`);
+    // 같은 팀원으로 점수만 고치는 경우: 처음 계산했던 예상 승률과 K값을 그대로 써서, 고치거나 되돌려도 Rating이 정확히 맞도록
+    let basis = null;
+    if (existing && sameMembers(existing.sideA.members, sideA.members) && sameMembers(existing.sideB.members, sideB.members)) {
+      const kByPlayer = {};
+      Object.values(nextPlayers).forEach((pl) => {
+        const h = (pl.history || []).find((x) => x.recordId === recordId && typeof x.k === 'number');
+        if (h) kByPlayer[pl.id] = h.k;
+      });
+      basis = { expectA: existing.expectA, kByPlayer };
+    }
+    if (existing) revertRecord(nextPlayers, recordId);
+    const record = {
+      ...(existing || {}),
+      id: recordId, date: viewDate, sideA, sideB, games, winsA, winsB: games - winsA, fromTeams,
+      createdAt: existing?.createdAt || nowIso,
+      enteredBy: existing?.enteredBy || myName,
+      ...(existing ? { editedBy: myName, editedAt: nowIso } : {}),
+    };
+    const { deltas, expectA } = applyRecord(nextPlayers, record, basis);
+    record.expectA = expectA;
+    await savePlayers(nextPlayers);
+    const nextRecords = existing
+      ? freshDaily.records.map((r) => (r.id === recordId ? record : r))
+      : [...(freshDaily.records || []), record];
+    await saveDaily({ ...freshDaily, records: nextRecords });
+
+    const snapshot = (r) => ({ sideA: r.sideA, sideB: r.sideB, games: r.games, winsA: r.winsA, winsB: r.winsB, fromTeams: r.fromTeams });
+    const freshLogs = await loadFreshLogs();
+    const logEntry = existing
+      ? { id: uniqueId(`edit-${viewDate}`), type: 'record-edit', recordId, date: viewDate, timestamp: nowIso, adminName: myName, before: snapshot(existing), after: snapshot(record), undone: false }
+      : { id: recordId, type: 'record', recordId, date: viewDate, timestamp: nowIso, adminName: myName, labelA: sideA.label, labelB: sideB.label, games, winsA, winsB: games - winsA, fromTeams, playerDeltas: deltas, undone: false };
+    await saveLogs([logEntry, ...freshLogs]);
+    return logEntry;
+  };
+
+  const handleSaveRecord = async () => {
+    setError('');
+    const sides = recSides();
+    if (!sides || recWinsA === null) return;
+    setBusy(true);
+    try {
+      // 잠금이 내 것인지 확인 (오래 자리를 비워 풀렸으면 다시 잡아봄)
+      const lock = await readLock();
+      if (!lock || lock.by !== currentPlayerId) {
+        const ok = await acquireLock();
+        if (!ok) { setError('다른 사람이 입력중입니다. 잠시 후 다시 시도해주세요.'); return; }
+      }
+      await saveRecordCore({ editingId: editingRecordId, ...sides, games: recGames, winsA: recWinsA });
+      await releaseLock();
+      setShowRecordForm(false);
+      setEditingRecordId(null);
+      setConfirmingRecord(false);
+      setRecWinsA(null);
+      setRecGames(1);
+    } catch (e) {
+      setError(`결과 저장 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 관리자 로그: 수정 전 내용으로 되돌리기
+  const handleRevertEdit = async (logId) => {
+    setError('');
     const entry = logs.find((l) => l.id === logId);
     if (!entry || entry.undone) return;
     setBusy(true);
     try {
-      const pRes = await api.get('players').catch(() => null);
-      const freshPlayers = pRes ? JSON.parse(pRes.value) : players;
+      const ok = await acquireLock();
+      if (!ok) { setError('다른 사람이 입력중입니다. 잠시 후 다시 시도해주세요.'); return; }
+      try {
+        await saveRecordCore({ editingId: entry.recordId, ...entry.before });
+        const freshLogs = await loadFreshLogs();
+        await saveLogs(freshLogs.map((l) => (l.id === logId ? { ...l, undone: true } : l)));
+      } finally {
+        await releaseLock();
+      }
+    } catch (e) {
+      setError(`되돌리는 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ----- 오늘 경기 마감 + 승부예측 결과 확정 -----
+  const handleClosePredictions = async () => {
+    setError('');
+    setBusy(true);
+    try {
+      const freshDaily = await loadFreshDaily();
+      if (freshDaily.predictionResult?.finalized) return;
+      const labels = TEAM_LABELS.filter((l) => freshDaily.teams?.[l]?.length);
+      const recs = (freshDaily.records || []).filter((r) => r.fromTeams);
+      if (!recs.length) { setError('오늘 팀끼리 기록된 경기가 없어요.'); return; }
+      const st = Object.fromEntries(labels.map((l) => [l, 0]));
+      recs.forEach((r) => {
+        if (r.sideA.label in st) st[r.sideA.label] += r.winsA;
+        if (r.sideB.label in st) st[r.sideB.label] += r.winsB;
+      });
+      const max = Math.max(...labels.map((l) => st[l]));
+      const winners = labels.filter((l) => st[l] === max);
+      const isVoid = winners.length !== 1; // 1위가 동률이면 예측은 무효
+      const predictionId = uniqueId(`pred-${viewDate}`);
+      const deltas = [];
+
+      if (!isVoid) {
+        const freshPlayers = await loadFreshPlayers();
+        const nextPlayers = { ...freshPlayers };
+        Object.entries(freshDaily.predictions || {}).forEach(([pid, pick]) => {
+          const pl = nextPlayers[pid];
+          if (!pl) return;
+          const correct = pick === winners[0];
+          nextPlayers[pid] = {
+            ...pl,
+            predictionScore: (pl.predictionScore || 0) + (correct ? 1 : 0),
+            history: [...(pl.history || []), { kind: 'prediction', predictionId, date: viewDate, predicted: pick, predictionCorrect: correct }],
+          };
+          deltas.push({ playerId: pid, winsDelta: 0, lossesDelta: 0, predictionScoreDelta: correct ? 1 : 0, eloDelta: 0 });
+        });
+        await savePlayers(nextPlayers);
+      }
+
+      await saveDaily({
+        ...freshDaily,
+        predictionResult: { finalized: true, winners, void: isVoid, standings: st, predictionId, timestamp: new Date().toISOString() },
+      });
+      const freshLogs = await loadFreshLogs();
+      await saveLogs([{
+        id: predictionId, type: 'prediction', predictionId, date: viewDate, timestamp: new Date().toISOString(),
+        adminName: me?.name || currentPlayerId, winners, void: isVoid, playerDeltas: deltas, undone: false,
+      }, ...freshLogs]);
+      setConfirmingClose(false);
+    } catch (e) {
+      setError(`마감 처리 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ----- 업데이트 로그에서 취소 -----
+  const handleUndo = async (logId) => {
+    setError('');
+    const entry = logs.find((l) => l.id === logId);
+    if (!entry || entry.undone) return;
+    const type = entry.type || 'legacy';
+    setBusy(true);
+    try {
+      const dayData = await loadFreshDaily(entry.date);
+      if (type === 'record') {
+        const rec = (dayData.records || []).find((r) => r.id === entry.recordId);
+        if (rec?.fromTeams && dayData.predictionResult?.finalized) {
+          setError('이 날은 예측 결과가 이미 확정됐어요. 로그에서 "예측 결과 확정"을 먼저 취소한 뒤 다시 시도해주세요.');
+          return;
+        }
+      }
+
+      const freshPlayers = await loadFreshPlayers();
       const nextPlayers = { ...freshPlayers };
-      entry.playerDeltas.forEach((d) => {
-        if (!nextPlayers[d.playerId]) return;
-        const filteredHistory = (nextPlayers[d.playerId].history || []).filter((h) => h.date !== entry.date);
+
+      if (type === 'record') {
+        // 기록 삭제: 수정된 적이 있어도 지금 내용 그대로 되돌림
+        revertRecord(nextPlayers, entry.recordId);
+        await savePlayers(nextPlayers);
+        const nextDay = { ...dayData, records: (dayData.records || []).filter((r) => r.id !== entry.recordId) };
+        if (entry.date === viewDate) await saveDaily(nextDay);
+        else await apiSetWithRetry(`daily:${entry.date}`, JSON.stringify(nextDay));
+        const freshLogs = await loadFreshLogs();
+        await saveLogs(freshLogs.map((l) => (l.recordId === entry.recordId ? { ...l, undone: true, deleted: true } : l)));
+        return;
+      }
+
+      const keepHistory = (h) => {
+        if (type === 'record') return h.recordId !== entry.recordId;
+        if (type === 'prediction') return h.predictionId !== entry.predictionId;
+        return !(h.date === entry.date && !h.kind); // 예전 방식 기록
+      };
+      (entry.playerDeltas || []).forEach((d) => {
+        const pl = nextPlayers[d.playerId];
+        if (!pl) return;
         nextPlayers[d.playerId] = {
-          ...nextPlayers[d.playerId],
-          wins: (nextPlayers[d.playerId].wins || 0) - d.winsDelta,
-          losses: (nextPlayers[d.playerId].losses || 0) - d.lossesDelta,
-          predictionScore: (nextPlayers[d.playerId].predictionScore || 0) - d.predictionScoreDelta,
-          elo: eloOf(nextPlayers[d.playerId]) - (d.eloDelta || 0),
-          history: filteredHistory,
+          ...pl,
+          wins: (pl.wins || 0) - (d.winsDelta || 0),
+          losses: (pl.losses || 0) - (d.lossesDelta || 0),
+          predictionScore: (pl.predictionScore || 0) - (d.predictionScoreDelta || 0),
+          elo: eloOf(pl) - (d.eloDelta || 0),
+          history: (pl.history || []).filter(keepHistory),
         };
       });
       await savePlayers(nextPlayers);
 
-      if (entry.date === dateKey) {
-        await saveDaily({ ...daily, result: null });
-      } else {
-        const dRes = await api.get(`daily:${entry.date}`).catch(() => null);
-        if (dRes) {
-          const dayData = JSON.parse(dRes.value);
-          dayData.result = null;
-          await apiSetWithRetry(`daily:${entry.date}`, JSON.stringify(dayData));
-        }
-      }
+      let nextDay = { ...dayData };
+      if (type === 'record') nextDay.records = (dayData.records || []).filter((r) => r.id !== entry.recordId);
+      else if (type === 'prediction') nextDay.predictionResult = null;
+      else nextDay.result = null;
+      if (entry.date === viewDate) await saveDaily(nextDay);
+      else await apiSetWithRetry(`daily:${entry.date}`, JSON.stringify(nextDay));
 
-      const nextLogs = logs.map((l) => (l.id === logId ? { ...l, undone: true } : l));
-      await saveLogs(nextLogs);
+      const freshLogs = await loadFreshLogs();
+      await saveLogs(freshLogs.map((l) => (l.id === logId ? { ...l, undone: true } : l)));
     } catch (e) {
       setError(`취소 처리 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
     } finally {
@@ -834,13 +1621,46 @@ function BasketballClubApp() {
     setBusy(true);
     try {
       const pRes = await api.get('players').catch(() => null);
-      const fresh = pRes ? JSON.parse(pRes.value) : players;
+      const fresh = pRes ? parsePlayers(pRes) : players;
       if (!fresh[currentPlayerId]) { setError('내 정보를 찾을 수 없습니다.'); return; }
       const next = { ...fresh, [currentPlayerId]: { ...fresh[currentPlayerId], height: h } };
       await savePlayers(next);
       setHeightDraft(null);
     } catch (e) {
       setError(`키 저장 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setMemberDraft = (id, field, value) => {
+    setMemberMsg('');
+    setMemberDrafts((d) => ({ ...d, [id]: { ...(d[id] || {}), [field]: value } }));
+  };
+
+  const handleAdminSaveMember = async (id) => {
+    setError('');
+    setMemberMsg('');
+    const draft = memberDrafts[id] || {};
+    const update = {};
+    if (draft.position !== undefined) update.position = normalizePosition(draft.position);
+    if (draft.height !== undefined) {
+      const h = validHeight(draft.height);
+      if (h === null) { setError(`키는 ${MIN_HEIGHT}~${MAX_HEIGHT} 사이 숫자(cm)로 입력해주세요.`); return; }
+      update.height = h;
+    }
+    if (!Object.keys(update).length) return;
+    setBusy(true);
+    try {
+      const pRes = await api.get('players').catch(() => null);
+      const fresh = pRes ? parsePlayers(pRes) : players;
+      if (!fresh[id]) { setError('회원 정보를 찾을 수 없습니다.'); return; }
+      const next = { ...fresh, [id]: { ...fresh[id], ...update } };
+      await savePlayers(next);
+      setMemberDrafts((d) => { const n = { ...d }; delete n[id]; return n; });
+      setMemberMsg(`${fresh[id].name}님 정보를 저장했어요.`);
+    } catch (e) {
+      setError(`회원 정보 저장 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
     } finally {
       setBusy(false);
     }
@@ -855,7 +1675,7 @@ function BasketballClubApp() {
     setBusy(true);
     try {
       const pRes = await api.get('players').catch(() => null);
-      const fresh = pRes ? JSON.parse(pRes.value) : players;
+      const fresh = pRes ? parsePlayers(pRes) : players;
       const player = fresh[currentPlayerId];
       if (!player) { setError('내 정보를 찾을 수 없습니다.'); return; }
       const ok = await verifyPassword(curPassword, player);
@@ -898,7 +1718,7 @@ function BasketballClubApp() {
       const backup = {
         version: 1,
         exportedAt: new Date().toISOString(),
-        players: pRes ? JSON.parse(pRes.value) : {},
+        players: pRes ? parsePlayers(pRes) : {},
         updateLog: lRes ? JSON.parse(lRes.value) : [],
         daily: dailyData,
       };
@@ -938,7 +1758,8 @@ function BasketballClubApp() {
     }
     setBusy(true);
     try {
-      await apiSetWithRetry('players', JSON.stringify(parsed.players || {}));
+      parsed.players = normalizePlayers(parsed.players);
+      await apiSetWithRetry('players', JSON.stringify(parsed.players));
       await apiSetWithRetry('updateLog', JSON.stringify(parsed.updateLog || []));
       const dailyEntries = Object.entries(parsed.daily || {});
       for (const [date, data] of dailyEntries) {
@@ -946,7 +1767,7 @@ function BasketballClubApp() {
       }
       setPlayers(parsed.players || {});
       setLogs(parsed.updateLog || []);
-      if (parsed.daily && parsed.daily[dateKey]) setDaily(parsed.daily[dateKey]);
+      if (parsed.daily && parsed.daily[viewDate]) setDaily(parsed.daily[viewDate]);
 
       if (!parsed.players[currentPlayerId]) {
         localStorage.removeItem('currentPlayerId');
@@ -982,14 +1803,106 @@ function BasketballClubApp() {
     };
   });
   const qualifies = (p) => p.games >= RANKING_MIN_GAMES;
+  const hasGames = (p) => p.games > 0;
+  // 순위에 든 사람이 먼저, 그다음 랭킹 진입 전 사람들도 같은 점수 기준으로 그들끼리 순위 (기록 없는 사람은 맨 아래)
   const winRanking = [...scoredPlayers].sort((a, b) =>
     (qualifies(b) - qualifies(a))
-    || (qualifies(a) ? (b.winScore - a.winScore) || (b.games - a.games) : (b.games - a.games) || (b.winScore - a.winScore)));
+    || (hasGames(b) - hasGames(a))
+    || (b.winScore - a.winScore) || (b.games - a.games));
   const predRanking = [...scoredPlayers].sort((a, b) => (b.predScore - a.predScore) || (b.pred.total - a.pred.total));
   const skillRanking = [...scoredPlayers].sort((a, b) =>
     (qualifies(b) - qualifies(a))
-    || (qualifies(a) ? (b.skill - a.skill) || (b.games - a.games) : (b.games - a.games) || (b.skill - a.skill)));
+    || (hasGames(b) - hasGames(a))
+    || (b.skill - a.skill) || (b.games - a.games));
   const rankedPlayers = rankMode === 'skill' ? skillRanking : (rankMode === 'prediction' ? predRanking : winRanking);
+
+  // 화면과 이미지에 똑같이 쓰는 랭킹 한 줄씩
+  let unrankedCount = 0;
+  const rankingRows = rankedPlayers.map((p, idx) => {
+    let ranked;
+    let detail;
+    let scoreLabel;
+    const remaining = `랭킹 진입까지 ${RANKING_MIN_GAMES - p.games}경기`;
+    if (rankMode === 'skill') {
+      ranked = p.games >= RANKING_MIN_GAMES;
+      const recent = typeof p.lastEloDelta === 'number' ? ` · 최근 ${p.lastEloDelta >= 0 ? '+' : ''}${Math.round(p.lastEloDelta)}` : '';
+      detail = p.games === 0 ? '아직 경기 기록 없음' : `${p.games}경기${recent}${ranked ? '' : ` · ${remaining}`}`;
+      scoreLabel = p.games > 0 ? `${Math.round(p.skill)}` : '-';
+    } else if (rankMode === 'prediction') {
+      ranked = p.pred.total > 0;
+      detail = ranked ? `${p.pred.total}번 중 ${p.pred.correct}번 적중 · ${pct(p.pred.correct, p.pred.total)}` : '아직 예측 기록 없음';
+      scoreLabel = ranked ? `${Math.round(p.predScore * 100)}점` : '-';
+    } else {
+      ranked = p.games >= RANKING_MIN_GAMES;
+      detail = p.games === 0 ? '아직 경기 기록 없음' : `${p.wins || 0}승 ${p.losses || 0}패 · 승률 ${pct(p.wins || 0, p.games)}${ranked ? '' : ` · ${remaining}`}`;
+      scoreLabel = p.games > 0 ? `${Math.round(p.winScore * 100)}점` : '-';
+    }
+    // 랭킹 진입 전 사람들은 그 사람들끼리의 순위 (기록이 없으면 '-')
+    const hasRecord = rankMode === 'prediction' ? p.pred.total > 0 : p.games > 0;
+    const groupRank = !ranked && hasRecord ? ++unrankedCount : null;
+    return { id: p.id, name: p.name, position: p.position, ranked, rank: ranked ? idx + 1 : null, groupRank, detail, scoreLabel, isTop: idx === 0 && ranked, isMe: p.id === currentPlayerId };
+  });
+  const rankingNeedsGames = rankMode !== 'prediction';
+  const firstUnrankedIdx = rankingRows.findIndex((r) => !r.ranked);
+
+  const isIOSDevice = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  const handleMakeRankingImage = async () => {
+    setError('');
+    setRankImageBusy(true);
+    try {
+      const d = new Date();
+      const dateText = `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 기준`;
+      const rule = rankMode === 'prediction'
+        ? '적중률과 예측 횟수를 함께 본 점수 순'
+        : rankMode === 'skill'
+          ? `팀 전력을 고려한 Rating 순 · ${RANKING_MIN_GAMES}경기 이상만 순위`
+          : `승률과 판수를 함께 본 점수 순 · ${RANKING_MIN_GAMES}경기 이상만 순위`;
+      const stamp = `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`;
+      const blob = await renderRankingImage({
+        clubName: CLUB_NAME,
+        title: RANK_TITLES[rankMode],
+        lines: [dateText, rule],
+        rows: rankingRows,
+        unrankedLabel: rankingNeedsGames ? `랭킹 진입 전 (${RANKING_MIN_GAMES}경기 미만)` : '예측 기록 없음',
+      });
+      if (rankImage) URL.revokeObjectURL(rankImage.url);
+      // 파일 이름은 영문으로 (한글 파일 이름은 일부 휴대폰에서 'download'로 바뀌어 저장됨)
+      const fileMode = { winrate: 'winrate', prediction: 'prediction', skill: 'rating' }[rankMode];
+      setRankImage({ url: URL.createObjectURL(blob), blob, fileName: `ranking-${fileMode}-${stamp.replace(/\./g, '')}.png` });
+    } catch (e) {
+      setError(`이미지를 만드는 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
+    } finally {
+      setRankImageBusy(false);
+    }
+  };
+
+  const handleSaveRankingImage = async () => {
+    if (!rankImage) return;
+    // 아이폰: 공유 메뉴의 '이미지 저장'으로 사진 앱에 저장 / 그 외: 바로 다운로드
+    if (isIOSDevice && navigator.canShare) {
+      try {
+        const file = new File([rankImage.blob], rankImage.fileName, { type: 'image/png' });
+        if (navigator.canShare({ files: [file] })) {
+          await navigator.share({ files: [file] });
+          return;
+        }
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // 사용자가 공유 창을 닫음
+      }
+    }
+    const a = document.createElement('a');
+    a.href = rankImage.url;
+    a.download = rankImage.fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  const closeRankImage = () => {
+    if (rankImage) URL.revokeObjectURL(rankImage.url);
+    setRankImage(null);
+  };
 
   const myGames = gamesPlayed(me);
   const myPred = predictionStats(me);
@@ -1076,13 +1989,14 @@ function BasketballClubApp() {
                 <input value={regName} onChange={(e) => setRegName(e.target.value)} placeholder="이름" className="w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" />
                 <input value={regEmpId} onChange={(e) => setRegEmpId(e.target.value)} placeholder="사번" className="w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" />
                 <input value={regHeight} onChange={(e) => setRegHeight(e.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric" placeholder="키 (cm, 예: 178)" className="w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" />
-                <div className="flex gap-2">
+                <div className="grid grid-cols-5 gap-1.5">
                   {POSITIONS.map((pos) => (
                     <button
                       key={pos} onClick={() => setRegPosition(pos)}
-                      className={`flex-1 py-2 rounded-lg text-xs font-bold border ${regPosition === pos ? 'bg-orange-600 text-white border-orange-600' : 'border-slate-200 text-slate-500'}`}
+                      className={`py-2 rounded-lg border flex flex-col items-center leading-tight ${regPosition === pos ? 'bg-orange-600 text-white border-orange-600' : 'border-slate-200 text-slate-500'}`}
                     >
-                      {pos}
+                      <span className="text-sm font-black">{POSITION_ABBR[pos]}</span>
+                      <span className="text-xs font-medium">{POSITION_SHORT[pos]}</span>
                     </button>
                   ))}
                 </div>
@@ -1149,28 +2063,69 @@ function BasketballClubApp() {
 
           {tab === 'today' && (
             <div className="space-y-4">
-              <p className="text-slate-400 text-xs font-bold tracking-wide">{formatDateLabel(dateKey)} 오늘의 경기</p>
+              <div className="flex items-center justify-between">
+                <button
+                  onClick={() => goToDate(shiftDate(viewDate, -1))} disabled={busy}
+                  className="w-9 h-9 rounded-full bg-white shadow-sm text-slate-600 text-lg font-bold"
+                  aria-label="이전 날"
+                >
+                  ‹
+                </button>
+                <div className="text-center">
+                  <p className="text-sm font-bold text-slate-800">{formatDateLabel(viewDate)}</p>
+                  <p className="text-xs text-slate-400">{isToday ? '오늘의 경기' : '지난 경기 · 결과 사후입력'}</p>
+                </div>
+                <button
+                  onClick={() => goToDate(shiftDate(viewDate, 1))} disabled={busy || isToday}
+                  className="w-9 h-9 rounded-full bg-white shadow-sm text-slate-600 text-lg font-bold disabled:opacity-30"
+                  aria-label="다음 날"
+                >
+                  ›
+                </button>
+              </div>
+              <div className="flex items-center justify-center gap-3 -mt-2">
+                <input
+                  type="date" value={viewDate} max={dateKey}
+                  onChange={(e) => goToDate(e.target.value)}
+                  className="text-xs text-slate-500 bg-transparent focus:outline-none"
+                />
+                {!isToday && (
+                  <button onClick={() => goToDate(dateKey)} className="text-xs font-bold text-orange-600">오늘로 돌아가기</button>
+                )}
+              </div>
 
-              {!validHeight(me.height) && (
+              {isToday && !validHeight(me.height) && (
                 <button onClick={() => setTab('mypage')} className="w-full bg-orange-50 text-orange-700 rounded-xl px-4 py-3 text-xs font-bold text-left">
                   키를 입력하면 팀 배정이 더 정확해져요. 마이페이지에서 입력하기
                 </button>
               )}
 
+              {/* 참가신청 */}
               <div className="bg-white rounded-2xl p-4 shadow-sm">
-                <div className="flex items-center justify-between mb-3">
-                  <div className="flex items-center gap-1.5 text-slate-800 font-bold text-sm">
-                    👥 참석 인원 {attendeePlayers.length}명
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-slate-800 font-bold text-sm flex-wrap">
+                    <span>👥 참가신청 {attendeePlayers.length}명</span>
+                    {isToday && more > 0 && (
+                      <span className="text-xs font-black text-white bg-orange-600 rounded-full px-2 py-0.5 animate-pulse">{more} more!</span>
+                    )}
+                    {isToday && more === 0 && TEAM_COUNT_BY_SIZE[attendeePlayers.length] && (
+                      <span className="text-xs font-bold text-emerald-700 bg-emerald-50 rounded-full px-2 py-0.5">{TEAM_COUNT_BY_SIZE[attendeePlayers.length]}팀 경기 가능</span>
+                    )}
                   </div>
-                  {!daily.result?.finalized && (
+                  {signupOpen ? (
                     <button
                       onClick={handleToggleAttendance} disabled={busy}
-                      className={`text-xs font-bold px-4 py-2 rounded-full ${iAttend ? 'bg-slate-100 text-slate-500' : 'bg-orange-600 text-white'}`}
+                      className={`text-xs font-bold px-4 py-2 rounded-full shrink-0 ${iAttend ? 'bg-slate-100 text-slate-500' : 'bg-orange-600 text-white'}`}
                     >
-                      {iAttend ? '✕ 참석 취소' : '✓ 참석하기'}
+                      {iAttend ? '✕ 신청 취소' : '✓ 참가신청'}
                     </button>
+                  ) : (
+                    <span className="text-xs font-bold text-slate-400 shrink-0">{isToday && nowMin < SIGNUP_OPEN_MIN ? '오전 5시 오픈' : '신청 마감'}</span>
                   )}
                 </div>
+                <p className="text-xs text-slate-400 mt-1 mb-3">
+                  참가신청 오전 5:00 ~ 11:45{iAttend ? ' · 나는 신청 완료' : ''}
+                </p>
                 {attendeePlayers.length > 0 ? (
                   <div className="flex flex-wrap gap-2">
                     {attendeePlayers.map((p) => (
@@ -1181,113 +2136,412 @@ function BasketballClubApp() {
                     ))}
                   </div>
                 ) : (
-                  <p className="text-slate-400 text-xs">아직 참석 인원이 없어요. 참석 버튼을 눌러보세요!</p>
+                  <p className="text-slate-400 text-xs">아직 신청한 사람이 없어요.</p>
                 )}
               </div>
 
-              {me.isAdmin && !daily.teams && (
-                <button
-                  onClick={handleGenerateTeams} disabled={busy || attendeePlayers.length < 2}
-                  className="w-full bg-slate-900 text-white rounded-xl py-3 text-sm font-bold flex items-center justify-center gap-2 disabled:opacity-40"
-                >
-                  👥 팀 나누기
-                </button>
-              )}
-
-              {daily.teams && (
-                <div className="bg-white rounded-2xl overflow-hidden shadow-sm">
-                  <div className="bg-slate-900 py-3 flex items-center justify-center gap-3">
-                    <span className="font-display text-xl text-blue-400">TEAM A</span>
-                    <span className="font-display text-lg text-slate-500">VS</span>
-                    <span className="font-display text-xl text-orange-400">TEAM B</span>
+              {/* 팀 나누기: 누구나. 이미 나눈 팀은 참가인원이 바뀌었을 때만 다시 나눌 수 있음 */}
+              {isToday && !dayClosed && (
+                <div className="bg-white rounded-2xl p-4 shadow-sm">
+                  <div className="flex items-center justify-between mb-3">
+                    <p className="text-slate-800 font-bold text-sm">팀 나누기</p>
+                    <p className="text-xs text-slate-400">신청 {attendeePlayers.length}명 기준 {autoTeamCount}팀</p>
                   </div>
-                  <div className="grid grid-cols-2 divide-x divide-slate-100">
-                    <div className="p-3">
-                      {daily.teams.A.map((id) => <PlayerRow key={id} player={players[id]} tone="bg-blue-600" />)}
+                  {attendanceChanged && !cachedForCurrent && teamRecords.length === 0 && (
+                    <div className="grid grid-cols-3 gap-2 mb-3">
+                      {[2, 3, 4].map((c) => (
+                        <button
+                          key={c}
+                          onClick={() => setTeamCountChoice(c)}
+                          className={`py-2 rounded-lg text-sm font-bold border ${teamCount === c ? 'bg-orange-600 text-white border-orange-600' : 'border-slate-200 text-slate-500'}`}
+                        >
+                          {c}팀{c === autoTeamCount ? ' (자동)' : ''}
+                        </button>
+                      ))}
                     </div>
-                    <div className="p-3">
-                      {daily.teams.B.map((id) => <PlayerRow key={id} player={players[id]} tone="bg-orange-600" />)}
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 divide-x divide-slate-100 border-t border-slate-100 bg-slate-50">
-                    {['A', 'B'].map((t) => {
-                      const s = teamSummary(daily.teams[t], players);
-                      return (
-                        <div key={t} className="px-3 py-2.5 space-y-0.5 text-xs text-slate-500">
-                          <p>평균 키 <span className="font-bold text-slate-700">{s.avgHeight ? `${s.avgHeight}cm` : '-'}</span></p>
-                          <p>최장신 <span className="font-bold text-slate-700">{s.maxHeight ? `${s.maxHeight}cm` : '-'}</span></p>
-                          <p>빅맨 <span className="font-bold text-slate-700">{s.centers + s.forwards}명</span> (센터 {s.centers}, 포워드 {s.forwards})</p>
-                          <p>평균 Rating <span className="font-bold text-slate-700">{s.avgElo ?? '-'}</span></p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  {me.isAdmin && !daily.result?.finalized && (
-                    <button onClick={handleGenerateTeams} disabled={busy} className="w-full py-2.5 text-xs font-bold text-slate-500 border-t border-slate-100">
-                      ↻ 팀 다시 나누기 (예측 초기화)
-                    </button>
                   )}
+                  <button
+                    onClick={handleGenerateTeams}
+                    disabled={busy || !canGenerateTeams}
+                    className="w-full bg-slate-900 text-white rounded-xl py-3 text-sm font-bold disabled:opacity-40"
+                  >
+                    {daily.teams && attendanceChanged && cachedForCurrent
+                      ? '↺ 이 인원의 기존 팀으로 되돌리기'
+                      : daily.teams ? '↻ 바뀐 인원으로 팀 다시 나누기' : '👥 팀 나누기'}
+                  </button>
+                  <p className="text-xs text-slate-400 mt-2">
+                    {teamRecords.length > 0
+                      ? '이 팀으로 기록된 경기가 있어서 다시 나눌 수 없어요.'
+                      : daily.teams && !attendanceChanged
+                        ? '이미 팀이 나뉘었어요. 참가인원이 바뀌면 다시 나눌 수 있어요.'
+                        : attendanceChanged && cachedForCurrent
+                          ? '지금과 같은 인원으로 나눈 팀이 이미 있어요. 같은 인원이면 항상 그 팀으로 정해져요.'
+                          : attendeePlayers.length < teamCount * 2
+                          ? `${teamCount}팀으로 나누려면 최소 ${teamCount * 2}명이 필요해요.`
+                          : daily.teams
+                            ? '참가인원이 바뀌었어요. 다시 나누면 승부예측은 초기화돼요.'
+                            : '누구나 누를 수 있어요.'}
+                  </p>
                 </div>
               )}
 
-              {daily.teams && (
+              {/* 오늘의 팀 */}
+              {teamLabels.length > 0 && (
+                <div className="bg-white rounded-2xl overflow-hidden shadow-sm">
+                  <div className="bg-slate-900 py-3 px-2 flex items-center justify-center gap-2 flex-wrap">
+                    {teamLabels.map((l, i) => (
+                      <React.Fragment key={l}>
+                        {i > 0 && <span className="font-display text-sm text-slate-500">VS</span>}
+                        <span className={`font-display ${teamLabels.length > 2 ? 'text-lg' : 'text-xl'} ${TEAM_STYLE[l].light}`}>
+                          {teamLabels.length > 2 ? l : `TEAM ${l}`}
+                        </span>
+                      </React.Fragment>
+                    ))}
+                  </div>
+                  {daily.teamsBy && (
+                    <div className="px-4 pt-2 flex items-center justify-between gap-2">
+                      <p className="text-xs text-slate-400">팀 나눔 {daily.teamsBy}{daily.teamsAt ? ` · ${formatDateTime(daily.teamsAt)}` : ''}</p>
+                      {(daily.teamHistory || []).length > 1 && (
+                        <button onClick={() => setShowTeamHistory((v) => !v)} className="text-xs text-slate-400 underline shrink-0">
+                          나눔 기록 {daily.teamHistory.length}회
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {showTeamHistory && (daily.teamHistory || []).length > 1 && (
+                    <div className="mx-4 mt-2 bg-slate-50 rounded-lg px-3 py-2 space-y-1">
+                      {[...daily.teamHistory].reverse().map((h, i) => (
+                        <p key={i} className="text-xs text-slate-500">
+                          {formatDateTime(h.at)} · {h.auto ? '자동' : h.by} · {h.size}명 {h.teamCount}팀
+                          {h.added?.length ? ` · +${h.added.join(', ')}` : ''}
+                          {h.removed?.length ? ` · -${h.removed.join(', ')}` : ''}
+                          {h.restored ? ' · 같은 인원의 기존 팀으로 되돌림' : ''}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                  {teamLabels.map((l) => {
+                    const sm = teamSummary(daily.teams[l], players);
+                    return (
+                      <div key={l} className="border-t border-slate-100">
+                        <div className="flex items-center justify-between px-4 pt-3">
+                          <p className={`font-display text-base ${TEAM_STYLE[l].dark}`}>TEAM {l}</p>
+                          <p className="text-xs text-slate-400">{daily.teams[l].length}명 · 평균 Rating {sm.avgElo ?? '-'}</p>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-3 px-4 pb-2">
+                          {daily.teams[l].map((id) => <PlayerRow key={id} player={players[id]} tone={TEAM_STYLE[l].tone} />)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* 승부예측 */}
+              {teamLabels.length > 0 && (
                 <div className="bg-white rounded-2xl p-4 shadow-sm">
-                  <p className="text-slate-800 font-bold text-sm mb-3">승부예측</p>
-                  <div className="grid grid-cols-2 gap-2">
-                    {['A', 'B'].map((team) => {
-                      const count = Object.values(daily.predictions || {}).filter((v) => v === team).length;
-                      const mine = daily.predictions?.[currentPlayerId] === team;
-                      const locked = daily.result?.finalized;
+                  <p className="text-slate-800 font-bold text-sm">승부예측</p>
+                  <p className="text-xs text-slate-400 mt-0.5 mb-3">
+                    {dayClosed
+                      ? '예측이 마감됐어요.'
+                      : !isToday
+                        ? '지난 날의 예측이에요. 관리자가 마감하면 결과가 확정돼요.'
+                        : predictionTimeOver
+                        ? '오후 12시 30분에 예측이 마감됐어요.'
+                        : predictionLocked
+                          ? '경기 결과가 입력돼서 예측이 마감됐어요.'
+                          : '오늘 가장 많이 이길 팀을 골라주세요. 오후 12:30 마감'}
+                  </p>
+                  <div className={`grid ${teamLabels.length === 3 ? 'grid-cols-3' : 'grid-cols-2'} gap-2`}>
+                    {teamLabels.map((l) => {
+                      const count = Object.values(daily.predictions || {}).filter((v) => v === l).length;
+                      const mine = daily.predictions?.[currentPlayerId] === l;
                       return (
                         <button
-                          key={team}
-                          onClick={() => handlePredict(team)}
-                          disabled={busy || locked}
-                          className={`rounded-xl py-3 text-center border-2 transition ${mine ? (team === 'A' ? 'border-blue-600 bg-blue-50' : 'border-orange-600 bg-orange-50') : 'border-slate-100'} disabled:opacity-70`}
+                          key={l}
+                          onClick={() => handlePredict(l)}
+                          disabled={busy || predictionLocked}
+                          className={`rounded-xl py-3 text-center border-2 transition ${mine ? TEAM_STYLE[l].soft : 'border-slate-100'} disabled:opacity-70`}
                         >
-                          <p className={`font-display text-lg ${team === 'A' ? 'text-blue-600' : 'text-orange-600'}`}>{team}팀 승리</p>
+                          <p className={`font-display text-lg ${TEAM_STYLE[l].dark}`}>{l}팀</p>
                           <p className="text-slate-400 text-xs font-medium mt-0.5">{count}표{mine && ' · 내 예측'}</p>
                         </button>
                       );
                     })}
                   </div>
-                  {daily.result?.finalized && (
+                  {daily.predictionResult?.finalized && (
                     <p className="text-center text-xs font-bold mt-3">
-                      {daily.predictions?.[currentPlayerId]
-                        ? (daily.predictions[currentPlayerId] === daily.result.winner
+                      {daily.predictionResult.void
+                        ? <span className="text-slate-400">1위가 동률이라 이번 예측은 무효 처리됐어요</span>
+                        : daily.predictions?.[currentPlayerId]
+                          ? (daily.predictions[currentPlayerId] === daily.predictionResult.winners[0]
                             ? <span className="text-emerald-600">내 예측 적중! 🎉</span>
                             : <span className="text-slate-400">내 예측은 빗나갔어요</span>)
-                        : <span className="text-slate-400">이번 경기는 예측하지 않았어요</span>}
+                          : <span className="text-slate-400">이번에는 예측하지 않았어요</span>}
                     </p>
                   )}
                 </div>
               )}
 
-              {me.isAdmin && daily.teams && !daily.result?.finalized && (
-                <div className="bg-white rounded-2xl p-4 shadow-sm">
-                  <p className="text-slate-800 font-bold text-sm mb-3">경기 결과 입력</p>
-                  {!confirmingWinner ? (
-                    <div className="grid grid-cols-2 gap-2">
-                      <button onClick={() => setConfirmingWinner('A')} className="bg-blue-600 text-white rounded-xl py-2.5 text-sm font-bold">A팀 승리</button>
-                      <button onClick={() => setConfirmingWinner('B')} className="bg-orange-600 text-white rounded-xl py-2.5 text-sm font-bold">B팀 승리</button>
-                    </div>
-                  ) : (
-                    <div className="bg-slate-50 rounded-xl p-3 text-center">
-                      <p className="text-sm font-bold text-slate-700 mb-3">{confirmingWinner}팀 승리로 확정할까요?</p>
-                      <div className="grid grid-cols-2 gap-2">
-                        <button onClick={() => setConfirmingWinner(null)} className="py-2 rounded-lg text-sm font-bold text-slate-500 bg-white">취소</button>
-                        <button onClick={() => handleSubmitResult(confirmingWinner)} disabled={busy} className="py-2 rounded-lg text-sm font-bold text-white bg-slate-900">확정</button>
-                      </div>
-                    </div>
-                  )}
+              {/* 오늘 우승 팀 */}
+              {daily.predictionResult?.finalized && !daily.predictionResult.void && (
+                <div className={`rounded-2xl p-4 text-center ${TEAM_STYLE[daily.predictionResult.winners[0]]?.tone || 'bg-slate-900'}`}>
+                  <p className="text-white text-xs font-bold opacity-80">오늘 경기 마감</p>
+                  <p className="font-display text-2xl text-white mt-0.5">{daily.predictionResult.winners[0]}팀 최다승</p>
+                  <p className="text-white text-xs mt-1 opacity-80">
+                    {Object.entries(daily.predictionResult.standings || {}).map(([l, w]) => `${l} ${w}승`).join(' · ')}
+                  </p>
                 </div>
               )}
 
-              {daily.result?.finalized && (
+              {/* 예전 방식으로 마감된 날 */}
+              {legacyFinal && (
                 <div className={`rounded-2xl p-4 text-center ${daily.result.winner === 'A' ? 'bg-blue-600' : 'bg-orange-600'}`}>
                   <p className="text-white text-xs font-bold opacity-80">경기 종료</p>
                   <p className="font-display text-2xl text-white mt-0.5">{daily.result.winner}팀 승리</p>
                   <p className="text-white text-xs mt-1 opacity-80">{formatDateTime(daily.result.timestamp)} 기록</p>
+                </div>
+              )}
+
+              {/* 오늘 경기 기록 */}
+              {(
+                <div className="bg-white rounded-2xl p-4 shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <p className="text-slate-800 font-bold text-sm">{isToday ? '오늘 경기 기록' : '그날 경기 기록'}</p>
+                    {teamRecords.length > 0 && (
+                      <p className="text-xs font-bold text-slate-500">{teamLabels.map((l) => `${l} ${standings[l]}승`).join(' · ')}</p>
+                    )}
+                  </div>
+
+                  {records.length === 0 ? (
+                    <p className="text-slate-400 text-xs mt-2">아직 기록된 경기가 없어요.</p>
+                  ) : (
+                    <div className="mt-3 space-y-2">
+                      {records.map((r) => (
+                        <div key={r.id} className={`bg-slate-50 rounded-xl px-3 py-2.5 ${editingRecordId === r.id && showRecordForm ? 'ring-2 ring-orange-500' : ''}`}>
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-sm font-bold text-slate-700 min-w-0">
+                              {sideName(r.sideA.label)} vs {sideName(r.sideB.label)}
+                              {!r.fromTeams && <span className="ml-1.5 text-xs text-slate-400 font-medium">직접 구성</span>}
+                            </p>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <p className="text-sm font-black text-slate-800">{r.winsA} : {r.winsB}</p>
+                              {!showRecordForm && !(r.fromTeams && daily.predictionResult?.finalized) && (
+                                <button
+                                  onClick={() => openRecordForm(r)}
+                                  disabled={busy || lockedByOther}
+                                  className="text-xs font-bold text-slate-500 bg-white border border-slate-200 rounded-full px-2 py-0.5 disabled:opacity-40"
+                                >
+                                  수정
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          <p className="text-xs text-slate-400 mt-0.5">
+                            {r.games}판 · 입력 {r.enteredBy || '-'}{r.editedBy ? ` · 수정 ${r.editedBy}` : ''}
+                          </p>
+                          {!r.fromTeams && (
+                            <div className="text-xs text-slate-500 mt-1 space-y-0.5">
+                              <p>팀1: {r.sideA.members.map((id) => players[id]?.name || '?').join(', ')}</p>
+                              <p>팀2: {r.sideB.members.map((id) => players[id]?.name || '?').join(', ')}</p>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* 누가 입력 중이면 안내 */}
+                  {!showRecordForm && (lockedByOther || lockNotice) && (
+                    <p className="mt-3 text-xs font-bold text-amber-700 bg-amber-50 rounded-lg px-3 py-2">
+                      ✍️ 다른 사람이 입력중입니다.{lockedByOther && editLock?.name ? ` (${editLock.name}님)` : ''}
+                    </p>
+                  )}
+
+                  {/* 결과 입력: 누구나 */}
+                  {!showRecordForm && (
+                    <button
+                      onClick={() => openRecordForm()}
+                      disabled={busy || lockedByOther}
+                      className="w-full mt-3 bg-slate-900 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-40"
+                    >
+                      + 경기 결과 입력
+                    </button>
+                  )}
+
+                  {showRecordForm && (() => {
+                    const canUseTeams = teamLabels.length >= 2 && !dayClosed;
+                    const mode = canUseTeams ? recMode : 'custom';
+                    const nameA = mode === 'teams' && activePair ? `${activePair[0]}팀` : '팀1';
+                    const nameB = mode === 'teams' && activePair ? `${activePair[1]}팀` : '팀2';
+                    const pickerPlayers = Object.values(players)
+                      .filter((p) => recShowAll || daily.attendance?.[p.id] || recAssign[p.id])
+                      .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ko'));
+                    const count1 = Object.values(recAssign).filter((v) => v === 1).length;
+                    const count2 = Object.values(recAssign).filter((v) => v === 2).length;
+                    return (
+                      <div className="mt-3 border-t border-slate-100 pt-3 space-y-3">
+                        <p className="text-sm font-bold text-slate-800">{editingRecordId ? '✏️ 기록 수정' : '✍️ 경기 결과 입력'}</p>
+                        <div className="flex rounded-lg bg-slate-100 p-1">
+                          <button
+                            onClick={() => { setRecMode('teams'); setConfirmingRecord(false); }}
+                            disabled={!canUseTeams}
+                            className={`flex-1 py-2 rounded-md text-xs font-bold disabled:opacity-40 ${mode === 'teams' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                          >
+                            {isToday ? '오늘' : '그날'} 팀끼리
+                          </button>
+                          <button
+                            onClick={() => { setRecMode('custom'); setConfirmingRecord(false); }}
+                            className={`flex-1 py-2 rounded-md text-xs font-bold ${mode === 'custom' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                          >
+                            직접 구성
+                          </button>
+                        </div>
+
+                        {mode === 'teams' ? (
+                          <div>
+                            <p className="text-xs text-slate-500 mb-2">맞붙은 두 팀을 고르세요. 이 기록은 {isToday ? '오늘' : '그날'} 승부예측에 반영돼요.</p>
+                            <div className="flex flex-wrap gap-2">
+                              {teamPairs.map(([a, b]) => {
+                                const selected = activePair && activePair[0] === a && activePair[1] === b;
+                                return (
+                                  <button
+                                    key={a + b}
+                                    onClick={() => { setRecPair([a, b]); setRecWinsA(null); setConfirmingRecord(false); }}
+                                    className={`px-3 py-2 rounded-lg text-sm font-bold border ${selected ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-600'}`}
+                                  >
+                                    {a} vs {b}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ) : (
+                          <div>
+                            <p className="text-xs text-slate-500 mb-2">이름을 누를 때마다 팀1 → 팀2 → 빼기 순으로 바뀌어요. 승부예측에는 반영되지 않아요.</p>
+                            {teamLabels.length > 0 && (
+                              <div className="flex flex-wrap gap-1.5 mb-2">
+                                {teamLabels.map((l) => (
+                                  <React.Fragment key={l}>
+                                    <button onClick={() => loadTeamInto(l, 1)} className="text-xs font-bold text-blue-600 bg-blue-50 rounded-lg px-2 py-1">{l}팀 → 팀1</button>
+                                    <button onClick={() => loadTeamInto(l, 2)} className="text-xs font-bold text-orange-600 bg-orange-50 rounded-lg px-2 py-1">{l}팀 → 팀2</button>
+                                  </React.Fragment>
+                                ))}
+                              </div>
+                            )}
+                            <div className="flex flex-wrap gap-1.5">
+                              {pickerPlayers.map((p) => {
+                                const side = recAssign[p.id];
+                                return (
+                                  <button
+                                    key={p.id}
+                                    onClick={() => cycleAssign(p.id)}
+                                    className={`text-xs font-bold rounded-full px-2.5 py-1.5 border ${side === 1 ? 'bg-blue-600 text-white border-blue-600' : side === 2 ? 'bg-orange-600 text-white border-orange-600' : 'border-slate-200 text-slate-500'}`}
+                                  >
+                                    {side ? `${side} ` : ''}{p.name}
+                                  </button>
+                                );
+                              })}
+                              {pickerPlayers.length === 0 && <p className="text-xs text-slate-400">참석자가 없어요. 아래에서 전체 회원을 불러오세요.</p>}
+                            </div>
+                            <div className="flex items-center justify-between mt-2">
+                              <p className="text-xs font-bold text-slate-500">
+                                <span className="text-blue-600">팀1 {count1}명</span> · <span className="text-orange-600">팀2 {count2}명</span>
+                              </p>
+                              <div className="flex gap-3">
+                                {count1 + count2 > 0 && (
+                                  <button onClick={() => { setRecAssign({}); setConfirmingRecord(false); }} className="text-xs text-slate-400 underline">모두 빼기</button>
+                                )}
+                                <button onClick={() => setRecShowAll((v) => !v)} className="text-xs text-slate-400 underline">
+                                  {recShowAll ? '참석자만 보기' : '전체 회원 보기'}
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-semibold text-slate-600">이 구성으로 한 판수</span>
+                          <div className="flex items-center gap-2">
+                            <button onClick={() => changeRecGames(-1)} className="w-8 h-8 rounded-lg bg-slate-100 text-slate-600 font-bold">−</button>
+                            <span className="w-6 text-center font-black text-slate-800">{recGames}</span>
+                            <button onClick={() => changeRecGames(1)} className="w-8 h-8 rounded-lg bg-slate-100 text-slate-600 font-bold">+</button>
+                          </div>
+                        </div>
+
+                        {recGames === 1 ? (
+                          <div className="grid grid-cols-2 gap-2">
+                            {[[1, nameA], [0, nameB]].map(([w, name]) => (
+                              <button
+                                key={name}
+                                onClick={() => { setRecWinsA(w); setConfirmingRecord(false); }}
+                                className={`py-2.5 rounded-xl text-sm font-bold ${recWinsA === w ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600'}`}
+                              >
+                                {name} 승
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="bg-slate-50 rounded-xl px-3 py-2.5">
+                            <p className="text-xs text-slate-500 mb-2">{nameA}의 승수를 정하면 {nameB} 승수는 자동으로 계산돼요.</p>
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm font-bold text-slate-700">{nameA}</span>
+                              <div className="flex items-center gap-2">
+                                <button onClick={() => { setRecWinsA((w) => Math.max(0, (w ?? 1) - 1)); setConfirmingRecord(false); }} className="w-8 h-8 rounded-lg bg-white text-slate-600 font-bold border border-slate-200">−</button>
+                                <span className="w-14 text-center font-black text-slate-800">
+                                  {recWinsA === null ? '- : -' : `${recWinsA} : ${recGames - recWinsA}`}
+                                </span>
+                                <button onClick={() => { setRecWinsA((w) => Math.min(recGames, (w ?? 0) + 1)); setConfirmingRecord(false); }} className="w-8 h-8 rounded-lg bg-white text-slate-600 font-bold border border-slate-200">+</button>
+                              </div>
+                              <span className="text-sm font-bold text-slate-700">{nameB}</span>
+                            </div>
+                          </div>
+                        )}
+
+                        {!confirmingRecord ? (
+                          <div className="grid grid-cols-2 gap-2">
+                            <button onClick={closeRecordForm} disabled={busy} className="py-2.5 rounded-xl text-sm font-bold text-slate-500 bg-slate-100">닫기</button>
+                            <button onClick={askSaveRecord} disabled={busy} className="py-2.5 rounded-xl text-sm font-bold text-white bg-orange-600 disabled:opacity-40">저장</button>
+                          </div>
+                        ) : (
+                          <div className="bg-slate-50 rounded-xl p-3 text-center">
+                            <p className="text-sm font-bold text-slate-700 mb-3">
+                              {nameA} {recWinsA} : {recGames - recWinsA} {nameB} ({recGames}판)으로 {editingRecordId ? '수정' : '저장'}할까요?
+                            </p>
+                            <div className="grid grid-cols-2 gap-2">
+                              <button onClick={() => setConfirmingRecord(false)} className="py-2 rounded-lg text-sm font-bold text-slate-500 bg-white">취소</button>
+                              <button onClick={handleSaveRecord} disabled={busy} className="py-2 rounded-lg text-sm font-bold text-white bg-slate-900">{editingRecordId ? '수정' : '저장'}</button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {/* 관리자: 그날 경기 마감 (지난 날도 가능) */}
+                  {me.isAdmin && !showRecordForm && teamRecords.length > 0 && !daily.predictionResult?.finalized && (
+                    !confirmingClose ? (
+                      <button
+                        onClick={() => setConfirmingClose(true)}
+                        className="w-full mt-2 border border-slate-200 text-slate-700 rounded-xl py-2.5 text-sm font-bold"
+                      >
+                        {isToday ? '오늘' : '그날'} 경기 마감 (예측 결과 확정)
+                      </button>
+                    ) : (
+                      <div className="bg-slate-50 rounded-xl p-3 mt-2 text-center">
+                        <p className="text-sm font-bold text-slate-700 mb-1">
+                          {leaders.length === 1
+                            ? `${leaders[0]}팀이 ${topWins}승으로 1위예요.`
+                            : `${leaders.join(', ')}팀이 ${topWins}승으로 동률이라 예측은 무효 처리돼요.`}
+                        </p>
+                        <p className="text-xs text-slate-400 mb-3">마감하면 출석과 예측이 닫히고, 오늘 팀끼리 기록은 더 추가할 수 없어요.</p>
+                        <div className="grid grid-cols-2 gap-2">
+                          <button onClick={() => setConfirmingClose(false)} className="py-2 rounded-lg text-sm font-bold text-slate-500 bg-white">취소</button>
+                          <button onClick={handleClosePredictions} disabled={busy} className="py-2 rounded-lg text-sm font-bold text-white bg-slate-900">마감</button>
+                        </div>
+                      </div>
+                    )
+                  )}
                 </div>
               )}
             </div>
@@ -1311,48 +2565,34 @@ function BasketballClubApp() {
                 {rankMode === 'winrate' && `승률과 판수를 함께 보고 매긴 점수 순이에요. 판수가 적으면 점수가 낮게 나오고, 기록이 쌓일수록 실제 승률에 가까워져요. ${RANKING_MIN_GAMES}경기 이상 뛴 사람만 순위에 들어가요.`}
                 {rankMode === 'prediction' && '적중률과 예측 횟수를 함께 보고 매긴 점수 순이에요. 예측 횟수가 적으면 점수가 낮게 나오고, 기록이 쌓일수록 실제 적중률에 가까워져요.'}
               </p>
+              <button
+                onClick={handleMakeRankingImage}
+                disabled={rankImageBusy || rankingRows.length === 0}
+                className="w-full bg-white border border-slate-200 rounded-xl py-2.5 text-sm font-bold text-slate-700 shadow-sm disabled:opacity-40"
+              >
+                {rankImageBusy ? '이미지 만드는 중...' : `📷 ${RANK_TITLES[rankMode]} 이미지로 저장`}
+              </button>
               <div className="bg-white rounded-2xl shadow-sm divide-y divide-slate-100">
-                {rankedPlayers.length === 0 && <p className="text-slate-400 text-xs p-4 text-center">등록된 선수가 없어요.</p>}
-                {rankedPlayers.map((p, idx) => {
-                  const needsGames = rankMode !== 'prediction';
-                  const ranked = needsGames ? p.games >= RANKING_MIN_GAMES : p.pred.total > 0;
-                  const firstUnranked = needsGames && !ranked && (idx === 0 || rankedPlayers[idx - 1].games >= RANKING_MIN_GAMES);
-                  const remaining = `랭킹 진입까지 ${RANKING_MIN_GAMES - p.games}경기`;
-
-                  let detail;
-                  let scoreLabel;
-                  if (rankMode === 'skill') {
-                    const recent = typeof p.lastEloDelta === 'number' ? ` · 최근 ${p.lastEloDelta >= 0 ? '+' : ''}${Math.round(p.lastEloDelta)}` : '';
-                    detail = p.games === 0 ? '아직 경기 기록 없음' : `${p.games}경기${recent}${ranked ? '' : ` · ${remaining}`}`;
-                    scoreLabel = p.games > 0 ? `${Math.round(p.skill)}` : '-';
-                  } else if (rankMode === 'prediction') {
-                    detail = ranked ? `${p.pred.total}번 중 ${p.pred.correct}번 적중 · ${pct(p.pred.correct, p.pred.total)}` : '아직 예측 기록 없음';
-                    scoreLabel = ranked ? `${Math.round(p.predScore * 100)}점` : '-';
-                  } else {
-                    detail = p.games === 0 ? '아직 경기 기록 없음' : `${p.wins || 0}승 ${p.losses || 0}패 · 승률 ${pct(p.wins || 0, p.games)}${ranked ? '' : ` · ${remaining}`}`;
-                    scoreLabel = p.games > 0 ? `${Math.round(p.winScore * 100)}점` : '-';
-                  }
-                  const isTop = idx === 0 && ranked;
-                  return (
-                    <React.Fragment key={p.id}>
-                      {firstUnranked && (
-                        <p className="px-4 py-2 bg-slate-50 text-xs font-bold text-slate-400">랭킹 진입 전 ({RANKING_MIN_GAMES}경기 미만)</p>
-                      )}
-                      <div className={`flex items-center gap-3 px-4 py-3 ${p.id === currentPlayerId ? 'bg-orange-50' : ''}`}>
-                        <span className={`font-display text-sm w-5 text-center ${isTop ? 'text-amber-500' : 'text-slate-300'}`}>{ranked ? idx + 1 : '-'}</span>
-                        <Avatar name={p.name} size="sm" tone={isTop ? 'bg-amber-500' : 'bg-slate-700'} />
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-sm font-bold text-slate-800 truncate">{p.name}</span>
-                            <PositionBadge position={p.position} />
-                          </div>
-                          <p className="text-xs text-slate-400 font-medium">{detail}</p>
+                {rankingRows.length === 0 && <p className="text-slate-400 text-xs p-4 text-center">등록된 선수가 없어요.</p>}
+                {rankingRows.map((r, idx) => (
+                  <React.Fragment key={r.id}>
+                    {rankingNeedsGames && idx === firstUnrankedIdx && (
+                      <p className="px-4 py-2 bg-slate-50 text-xs font-bold text-slate-400">랭킹 진입 전 ({RANKING_MIN_GAMES}경기 미만)</p>
+                    )}
+                    <div className={`flex items-center gap-3 px-4 py-3 ${r.isMe ? 'bg-orange-50' : ''}`}>
+                      <span className={`font-display text-sm w-5 text-center ${r.isTop ? 'text-amber-500' : r.ranked ? 'text-slate-300' : 'text-slate-200'}`}>{r.ranked ? r.rank : (r.groupRank ?? '-')}</span>
+                      <Avatar name={r.name} size="sm" tone={r.isTop ? 'bg-amber-500' : 'bg-slate-700'} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-sm font-bold text-slate-800 truncate">{r.name}</span>
+                          <PositionBadge position={r.position} />
                         </div>
-                        <p className={`text-sm font-black shrink-0 ${ranked ? 'text-slate-800' : 'text-slate-300'}`}>{scoreLabel}</p>
+                        <p className="text-xs text-slate-400 font-medium">{r.detail}</p>
                       </div>
-                    </React.Fragment>
-                  );
-                })}
+                      <p className={`text-sm font-black shrink-0 ${r.ranked ? 'text-slate-800' : 'text-slate-300'}`}>{r.scoreLabel}</p>
+                    </div>
+                  </React.Fragment>
+                ))}
               </div>
             </div>
           )}
@@ -1376,7 +2616,7 @@ function BasketballClubApp() {
                     value={me.position} onChange={(e) => handlePositionChange(e.target.value)}
                     className="text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-3 py-1.5 focus:outline-none"
                   >
-                    {POSITIONS.map((pos) => <option key={pos} value={pos}>{pos}</option>)}
+                    {POSITIONS.map((pos) => <option key={pos} value={pos}>{pos} ({POSITION_ABBR[pos]})</option>)}
                   </select>
                 </div>
                 <div className="flex items-center justify-between mt-3">
@@ -1476,32 +2716,47 @@ function BasketballClubApp() {
                   <p className="text-slate-400 text-xs p-4 text-center">아직 기록이 없어요.</p>
                 ) : (
                   <div className="divide-y divide-slate-100">
-                    {sortedHistory.slice(0, historyShowCount).map((h, idx) => (
-                      <div key={idx} className="flex items-center justify-between px-4 py-2.5">
-                        <div>
-                          <p className="text-sm font-semibold text-slate-700">{formatDateLabel(h.date)}</p>
-                          <p className="text-xs text-slate-400 mt-0.5">
-                            {h.team ? `${h.team}팀 출전` : '미출전'}
-                            {h.predicted && ` · ${h.predicted}팀 예측`}
-                          </p>
+                    {sortedHistory.slice(0, historyShowCount).map((h, idx) => {
+                      let sub;
+                      let right;
+                      if (h.kind === 'prediction') {
+                        sub = `승부예측 · ${h.predicted}팀 선택`;
+                        right = (
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${h.predictionCorrect ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
+                            {h.predictionCorrect ? '적중' : '실패'}
+                          </span>
+                        );
+                      } else if (h.kind === 'record') {
+                        sub = `${sideName(h.team)} vs ${sideName(h.opponent)} · ${h.wins + h.losses}판${h.manual ? ' · 직접 구성' : ''}`;
+                        right = (
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${h.wins > h.losses ? 'bg-emerald-50 text-emerald-600' : h.wins < h.losses ? 'bg-slate-100 text-slate-500' : 'bg-amber-50 text-amber-600'}`}>
+                            {h.wins}승 {h.losses}패
+                          </span>
+                        );
+                      } else {
+                        // 예전 방식 기록 (하루 1경기 + 예측이 한 줄에 같이 저장됨)
+                        sub = `${h.team ? `${h.team}팀 출전` : '미출전'}${h.predicted ? ` · ${h.predicted}팀 예측 ${h.predictionCorrect ? '적중' : '실패'}` : ''}`;
+                        right = h.result ? (
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${h.result === 'win' ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
+                            {h.result === 'win' ? '승' : '패'}
+                          </span>
+                        ) : null;
+                      }
+                      return (
+                        <div key={idx} className="flex items-center justify-between px-4 py-2.5">
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold text-slate-700">{formatDateLabel(h.date)}</p>
+                            <p className="text-xs text-slate-400 mt-0.5">{sub}</p>
+                          </div>
+                          <div className="text-right shrink-0">
+                            {right}
+                            {typeof h.eloDelta === 'number' && (
+                              <p className="text-xs text-slate-400 font-medium mt-1">Rating {h.eloDelta >= 0 ? '+' : ''}{Math.round(h.eloDelta)}</p>
+                            )}
+                          </div>
                         </div>
-                        <div className="text-right">
-                          {h.result && (
-                            <span className={`text-xs font-bold px-2 py-0.5 rounded ${h.result === 'win' ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
-                              {h.result === 'win' ? '승' : '패'}
-                            </span>
-                          )}
-                          {typeof h.eloDelta === 'number' && (
-                            <p className="text-xs text-slate-400 font-medium mt-1">Rating {h.eloDelta >= 0 ? '+' : ''}{Math.round(h.eloDelta)}</p>
-                          )}
-                          {h.predicted && (
-                            <p className={`text-xs font-medium mt-1 ${h.predictionCorrect ? 'text-emerald-600' : 'text-slate-400'}`}>
-                              예측 {h.predictionCorrect ? '적중' : '실패'}
-                            </p>
-                          )}
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
                 {sortedHistory.length > historyShowCount && (
@@ -1515,6 +2770,70 @@ function BasketballClubApp() {
 
           {tab === 'admin' && me.isAdmin && (
             <div className="space-y-3">
+              <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
+                <div className="p-4 pb-3">
+                  <p className="text-slate-800 font-bold text-sm">회원 관리 ({Object.keys(players).length}명)</p>
+                  <p className="text-slate-400 text-xs mt-0.5">포지션과 키를 바꾸고 저장을 누르세요.</p>
+                  <input
+                    value={memberSearch} onChange={(e) => setMemberSearch(e.target.value)}
+                    placeholder="이름 또는 사번 검색"
+                    className="w-full mt-3 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500"
+                  />
+                  {memberMsg && <p className="text-emerald-600 text-xs font-medium mt-2">{memberMsg}</p>}
+                </div>
+                <div className="divide-y divide-slate-100 border-t border-slate-100">
+                  {Object.values(players)
+                    .filter((p) => {
+                      const q = memberSearch.trim();
+                      return !q || (p.name || '').includes(q) || String(p.employeeId || '').includes(q);
+                    })
+                    .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ko'))
+                    .map((p) => {
+                      const draft = memberDrafts[p.id] || {};
+                      const posValue = draft.position ?? normalizePosition(p.position);
+                      const heightValue = draft.height ?? (p.height ? String(p.height) : '');
+                      const changed = (draft.position !== undefined && draft.position !== normalizePosition(p.position))
+                        || (draft.height !== undefined && draft.height !== String(p.height || ''));
+                      const games = gamesPlayed(p);
+                      return (
+                        <div key={p.id} className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <Avatar name={p.name} size="sm" />
+                            <span className="text-sm font-bold text-slate-800 truncate">{p.name}</span>
+                            {p.isAdmin && <span className="text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0">관리자</span>}
+                            {!validHeight(p.height) && <span className="text-xs text-red-500 font-bold bg-red-50 px-1.5 py-0.5 rounded shrink-0">키 미입력</span>}
+                          </div>
+                          <p className="text-xs text-slate-400 mt-1">
+                            사번 {p.employeeId} · {games}경기 · Rating {games > 0 ? Math.round(eloOf(p)) : '-'}
+                          </p>
+                          <div className="flex items-center gap-2 mt-2">
+                            <select
+                              value={posValue} onChange={(e) => setMemberDraft(p.id, 'position', e.target.value)}
+                              className="flex-1 min-w-0 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-1.5 focus:outline-none"
+                            >
+                              {POSITIONS.map((pos) => <option key={pos} value={pos}>{pos} ({POSITION_ABBR[pos]})</option>)}
+                            </select>
+                            <input
+                              value={heightValue}
+                              onChange={(e) => setMemberDraft(p.id, 'height', e.target.value.replace(/[^0-9]/g, ''))}
+                              inputMode="numeric" placeholder="키"
+                              className="w-16 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-1.5 text-right focus:outline-none focus:ring-2 focus:ring-orange-500"
+                            />
+                            <span className="text-xs text-slate-500">cm</span>
+                            <button
+                              onClick={() => handleAdminSaveMember(p.id)}
+                              disabled={busy || !changed}
+                              className="text-xs font-bold text-white bg-orange-600 rounded-lg px-2.5 py-1.5 disabled:opacity-30"
+                            >
+                              저장
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+
               <div className="bg-white rounded-2xl p-4 shadow-sm">
                 <p className="text-slate-800 font-bold text-sm mb-1">데이터 백업 / 복원</p>
                 <p className="text-slate-400 text-xs mb-3 leading-relaxed">
@@ -1571,15 +2890,33 @@ function BasketballClubApp() {
                   <div key={log.id} className="px-4 py-3 flex items-center justify-between gap-2">
                     <div className="min-w-0">
                       <p className="text-sm font-semibold text-slate-700 truncate">
-                        {formatDateLabel(log.date)} · <span className={log.winner === 'A' ? 'text-blue-600' : 'text-orange-600'}>{log.winner}팀 승리</span> 처리
+                        {formatDateLabel(log.date)} ·{' '}
+                        {log.type === 'record' && (
+                          <span>{sideName(log.labelA)} vs {sideName(log.labelB)} {log.winsA}:{log.winsB} ({log.games}판){log.fromTeams ? '' : ' 직접 구성'} 입력</span>
+                        )}
+                        {log.type === 'record-edit' && (
+                          <span>
+                            {sideName(log.after.sideA.label)} vs {sideName(log.after.sideB.label)} 수정: {log.before.winsA}:{log.before.winsB}({log.before.games}판) → {log.after.winsA}:{log.after.winsB}({log.after.games}판)
+                          </span>
+                        )}
+                        {log.type === 'prediction' && (
+                          <span>경기 마감 · {log.void ? '예측 무효 (동률)' : `${log.winners[0]}팀 최다승`}</span>
+                        )}
+                        {!log.type && (
+                          <span className={log.winner === 'A' ? 'text-blue-600' : 'text-orange-600'}>{log.winner}팀 승리 처리</span>
+                        )}
                       </p>
                       <p className="text-xs text-slate-400 mt-0.5">{log.adminName}님 · {formatDateTime(log.timestamp)}</p>
                     </div>
                     {log.undone ? (
-                      <span className="text-xs font-bold text-slate-300 shrink-0">취소됨</span>
+                      <span className="text-xs font-bold text-slate-300 shrink-0">{log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨'}</span>
+                    ) : log.type === 'record-edit' ? (
+                      <button onClick={() => handleRevertEdit(log.id)} disabled={busy} className="text-xs font-bold text-slate-600 shrink-0 border border-slate-200 rounded-full px-2.5 py-1">
+                        되돌리기
+                      </button>
                     ) : (
                       <button onClick={() => handleUndo(log.id)} disabled={busy} className="text-xs font-bold text-red-500 shrink-0 border border-red-200 rounded-full px-2.5 py-1">
-                        취소
+                        {log.type === 'record' ? '삭제' : '취소'}
                       </button>
                     )}
                   </div>
@@ -1588,6 +2925,31 @@ function BasketballClubApp() {
             </div>
           )}
         </div>
+
+        {rankImage && (
+          <div className="fixed inset-0 z-50 bg-black/70 flex flex-col" onClick={closeRankImage}>
+            <div className="flex-1 overflow-y-auto p-4" style={{ paddingTop: 'calc(1rem + env(safe-area-inset-top))' }}>
+              <img
+                src={rankImage.url} alt="랭킹 이미지"
+                className="w-full max-w-md mx-auto rounded-xl shadow-2xl"
+                onClick={(e) => e.stopPropagation()}
+              />
+            </div>
+            <div
+              className="bg-white w-full max-w-md mx-auto rounded-t-2xl p-4 space-y-2"
+              style={{ paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <p className="text-xs text-slate-400 text-center">저장이 안 되면 위 이미지를 길게 눌러서 저장하세요.</p>
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={closeRankImage} className="py-3 rounded-xl text-sm font-bold text-slate-500 bg-slate-100">닫기</button>
+                <button onClick={handleSaveRankingImage} className="py-3 rounded-xl text-sm font-bold text-white bg-orange-600">
+                  {isIOSDevice ? '사진에 저장' : '이미지 저장'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white border-t border-slate-100 flex px-2 pt-2" style={{ paddingBottom: 'calc(0.5rem + env(safe-area-inset-bottom))' }}>
           <button onClick={() => setTab('today')} className={`flex-1 flex flex-col items-center gap-0.5 py-1.5 rounded-xl ${tab === 'today' ? 'text-orange-600' : 'text-slate-400'}`}>
