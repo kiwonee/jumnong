@@ -111,6 +111,11 @@ const api = {
         const data = await postJson({ action: 'batch', ops, returnKeys });
         return data.values || {};
     },
+    // 조건이 맞을 때만 저장 → { applied, values }
+    async batchIf(ops, returnKeys, requires) {
+        const data = await postJson({ action: 'batch', ops, returnKeys, requires });
+        return { applied: data.applied !== false, values: data.values || {} };
+    },
     async tryLock(key, by, name, ttlMs) {
         return postJson({ action: 'tryLock', key, by, name, ttlMs });
     },
@@ -151,6 +156,65 @@ function parseJson(str, fallback) {
     }
 }
 const LOG_LIMIT = 300; // 업데이트 로그는 최근 300개까지 보관
+// ---------- 권한 ----------
+const ROLES = ['owner', 'admin', 'sub', 'member'];
+const ROLE_LABEL = { owner: '최종관리자', admin: '관리자', sub: '부관리자', member: '일반회원' };
+const ROLE_RANK = { owner: 3, admin: 2, sub: 1, member: 0 };
+// 예전 데이터: 관리자(isAdmin)였던 사람은 최종관리자, 나머지는 일반회원
+function roleOf(p) {
+    if (p && ROLES.includes(p.role))
+        return p.role;
+    return (p === null || p === void 0 ? void 0 : p.isAdmin) ? 'owner' : 'member';
+}
+function rankOf(p) {
+    return ROLE_RANK[roleOf(p)];
+}
+// 권한별로 할 수 있는 일
+const PERM = {
+    closeDay: 1, // 경기 마감: 부관리자 이상
+    editMembers: 1, // 회원 포지션, 키 수정: 부관리자 이상
+    undoLogs: 2, // 업데이트 로그 취소, 삭제, 되돌리기: 관리자 이상
+    endSeason: 2, // 시즌 종료: 관리자 이상
+    backup: 3, // 백업, 복원: 최종관리자
+};
+function can(p, perm) {
+    return rankOf(p) >= PERM[perm];
+}
+// 누가 누구를 어떤 권한으로 바꿀 수 있는지
+// 최종관리자: 모든 권한 지정 가능 / 관리자: 부관리자, 일반회원 사이만 / 그 외: 불가
+function rolesAssignable(actor, target) {
+    const a = roleOf(actor);
+    if (a === 'owner')
+        return ROLES;
+    if (a === 'admin' && ['sub', 'member'].includes(roleOf(target)))
+        return ['sub', 'member'];
+    return [];
+}
+// ---------- 소수점 ----------
+function r3(x) {
+    return Math.round((x || 0) * 1000) / 1000;
+}
+function fmtNum(x) {
+    const v = Math.round((x || 0) * 10) / 10;
+    return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+// ---------- 승부예측 점수 ----------
+// 단독 1위를 맞히면 1점, 공동 1위 중 하나를 골랐으면 1 ÷ (공동 1위 팀 수)점, 그 외 0점
+function predictionCredit(pick, winners) {
+    if (!winners || !winners.length || !winners.includes(pick))
+        return 0;
+    return r3(1 / winners.length);
+}
+// ---------- 숫자 뒤 조사 (시즌 1을 / 시즌 2를) ----------
+function numHasBatchim(n) {
+    return [true, true, false, true, false, false, true, true, true, false][Math.abs(n) % 10];
+}
+function eulReul(n) { return numHasBatchim(n) ? '을' : '를'; }
+function ieyo(n) { return numHasBatchim(n) ? '이에요' : '예요'; }
+// ---------- 시즌 ----------
+function currentSeasonOf(seasons) {
+    return (seasons === null || seasons === void 0 ? void 0 : seasons.current) || { number: 1, startAt: null, startDate: null };
+}
 // ============================================================
 // 유틸 함수
 // ============================================================
@@ -168,6 +232,11 @@ function formatDateLabel(dateStr) {
     const d = new Date(dateStr + 'T00:00:00');
     const days = ['일', '월', '화', '수', '목', '금', '토'];
     return `${d.getMonth() + 1}월 ${d.getDate()}일 (${days[d.getDay()]})`;
+}
+// 시각(ISO) → 그 시각의 날짜 'YYYY-MM-DD' (휴대폰 시간 기준)
+function dateKeyOf(iso) {
+    const d = new Date(iso);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 function shiftDate(dateStr, days) {
     const d = new Date(dateStr + 'T00:00:00');
@@ -243,9 +312,8 @@ function predictionStats(p) {
     if (typeof (p === null || p === void 0 ? void 0 : p.predTotal) === 'number')
         return { correct: p.predCorrect || 0, total: p.predTotal };
     const history = (p === null || p === void 0 ? void 0 : p.history) || [];
-    const total = history.filter((h) => h.predicted).length;
-    const correct = history.filter((h) => h.predicted && h.predictionCorrect).length;
-    return { correct, total };
+    const preds = history.filter((h) => h.predicted);
+    return { correct: r3(preds.reduce((a, h) => a + (typeof h.credit === 'number' ? h.credit : (h.predictionCorrect ? 1 : 0)), 0)), total: preds.length };
 }
 // 가장 최근 경기의 Rating 변화 (예전 데이터는 기록에서 찾음)
 function lastEloDeltaOf(p) {
@@ -264,7 +332,7 @@ function splitLegacyPlayer(p) {
         summary: {
             ...rest,
             predTotal: preds.length,
-            predCorrect: preds.filter((h) => h.predictionCorrect).length,
+            predCorrect: r3(preds.reduce((a, h) => a + (typeof h.credit === 'number' ? h.credit : (h.predictionCorrect ? 1 : 0)), 0)),
             lastEloDelta: lastRec ? lastRec.eloDelta : null,
             lastRecordId: lastRec ? (lastRec.recordId || null) : null,
         },
@@ -284,7 +352,7 @@ function winRatePct(p) {
 const ELO_BASE = 1500; // 처음 시작 점수
 const ELO_K_NEW = 40; // 경기 수가 적은 사람은 점수가 빨리 자리 잡도록 크게 움직임
 const ELO_K = 24; // 경기를 어느 정도 한 사람
-const ELO_NEW_GAMES = 10; // 이 경기 수 미만이면 '새로 온 사람'으로 봄
+const ELO_NEW_GAMES = 20; // 이 경기 수 미만이면 '새로 온 사람'으로 봄 (점수가 크게 움직이는 기간)
 function eloOf(p) {
     return typeof (p === null || p === void 0 ? void 0 : p.elo) === 'number' ? p.elo : ELO_BASE;
 }
@@ -603,7 +671,7 @@ function applyRecord(nextPlayers, record, basis = null) {
                 lastRecordId: recordId,
             };
             applied[id] = { wins: myWins, losses: myLosses, eloDelta, k };
-            historyEntries[id] = { id: recordId, kind: 'record', recordId, date, team: myLabel, opponent: oppLabel, wins: myWins, losses: myLosses, eloDelta, k, manual: !fromTeams };
+            historyEntries[id] = { id: recordId, kind: 'record', recordId, date, season: record.season || 1, team: myLabel, opponent: oppLabel, wins: myWins, losses: myLosses, eloDelta, k, manual: !fromTeams };
             deltas.push({ playerId: id, winsDelta: myWins, lossesDelta: myLosses, predictionScoreDelta: 0, eloDelta });
         });
     };
@@ -960,11 +1028,11 @@ function BasketballClubApp() {
     const [recWinsA, setRecWinsA] = useState(null); // 팀1(왼쪽)의 승수
     const [confirmingRecord, setConfirmingRecord] = useState(false);
     const [confirmingClose, setConfirmingClose] = useState(false);
-    const [showAdminClaim, setShowAdminClaim] = useState(false);
-    const [adminCodeInput, setAdminCodeInput] = useState('');
     const [rankMode, setRankMode] = useState('winrate');
     const [rankImage, setRankImage] = useState(null); // { url, blob, fileName }
     const [rankImageBusy, setRankImageBusy] = useState(false);
+    const [toast, setToast] = useState(''); // 잠깐 떴다 사라지는 안내
+    const [inviteFallback, setInviteFallback] = useState(''); // 자동 복사가 안 될 때 직접 복사할 초대 문구
     const [showChangePassword, setShowChangePassword] = useState(false);
     const [curPassword, setCurPassword] = useState('');
     const [newPassword, setNewPassword] = useState('');
@@ -972,7 +1040,13 @@ function BasketballClubApp() {
     const [pwChangeMsg, setPwChangeMsg] = useState('');
     const [historyShowCount, setHistoryShowCount] = useState(10);
     const [myHistory, setMyHistory] = useState(null); // 마이페이지에서 불러오는 내 경기 기록
+    const [seasons, setSeasons] = useState(null); // { current: { number, startAt, startDate }, past: [...] }
+    const [seasonView, setSeasonView] = useState(null); // 랭킹에서 보는 지난 시즌 번호 (null이면 이번 시즌)
+    const [seasonSnapshots, setSeasonSnapshots] = useState({});
+    const [confirmingSeasonEnd, setConfirmingSeasonEnd] = useState(false);
+    const [seasonMsg, setSeasonMsg] = useState('');
     const pendingRef = useRef(0); // 저장 중에는 주기적 새로고침이 화면을 덮어쓰지 않도록
+    const autoCloseRef = useRef(async () => { }); // 자동 마감 함수 (아래에서 연결)
     const [backupText, setBackupText] = useState('');
     const [backupMsg, setBackupMsg] = useState('');
     const [restoreText, setRestoreText] = useState('');
@@ -991,13 +1065,15 @@ function BasketballClubApp() {
             setEditLock(parseJson(values[lk], null));
         if (Object.prototype.hasOwnProperty.call(values, 'updateLog'))
             setLogs(parseJson(values.updateLog, []));
+        if (Object.prototype.hasOwnProperty.call(values, 'seasons'))
+            setSeasons(parseJson(values.seasons, null));
         const hk = `history:${currentPlayerId}`;
         if (currentPlayerId && Object.prototype.hasOwnProperty.call(values, hk))
             setMyHistory(parseJson(values[hk], []));
     };
     // 지금 보고 있는 탭에 필요한 데이터만
     const pollKeys = () => {
-        const keys = ['players', `daily:${viewDate}`, `editLock:${viewDate}`];
+        const keys = ['players', `daily:${viewDate}`, `editLock:${viewDate}`, 'seasons'];
         if (tab === 'admin')
             keys.push('updateLog');
         if (tab === 'mypage' && currentPlayerId)
@@ -1023,10 +1099,13 @@ function BasketballClubApp() {
     // 예전 형식(선수 정보 안에 경기 기록이 통째로)이면 한 번만 나눠서 저장
     const ensureMigrated = async (map) => {
         const legacyIds = Object.keys(map).filter((id) => Array.isArray(map[id].history));
-        if (!legacyIds.length)
+        const noRoleIds = Object.keys(map).filter((id) => !ROLES.includes(map[id].role));
+        if (!legacyIds.length && !noRoleIds.length)
             return map;
         const ops = [];
         const patches = [];
+        // 권한 단계 도입: 예전 관리자는 최종관리자, 나머지는 일반회원
+        noRoleIds.forEach((id) => patches.push({ op: 'set', path: [id, 'role'], value: roleOf(map[id]) }));
         legacyIds.forEach((id) => {
             const { summary, history } = splitLegacyPlayer(map[id]);
             ops.push({ key: `history:${id}`, type: 'setIfAbsent', value: JSON.stringify(history) });
@@ -1047,15 +1126,18 @@ function BasketballClubApp() {
         (async () => {
             setLoading(true);
             try {
-                const values = await api.getMany(['players', `daily:${dateKey}`, `editLock:${dateKey}`]);
+                const values = await api.getMany(['players', `daily:${dateKey}`, `editLock:${dateKey}`, 'seasons']);
                 let p = parsePlayers(values.players);
                 p = await ensureMigrated(p).catch(() => p);
                 setPlayers(p);
+                setSeasons(parseJson(values.seasons, null));
                 setDaily(parseJson(values[`daily:${dateKey}`], emptyDaily()));
                 setEditLock(parseJson(values[`editLock:${dateKey}`], null));
                 const savedId = localStorage.getItem('currentPlayerId');
                 if (savedId && p[savedId])
                     setCurrentPlayerId(savedId);
+                // 관리자가 마감하지 않은 지난 날은 자동으로 마감 (화면은 먼저 보여주고 뒤에서 처리)
+                setTimeout(() => { autoCloseRef.current().catch(() => { }); }, 0);
             }
             catch (e) {
                 console.error(e);
@@ -1159,7 +1241,7 @@ function BasketballClubApp() {
                 id: empId, name, employeeId: empId, passwordHash: hash, passwordMethod: method,
                 position: regPosition, height, elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0,
                 predTotal: 0, predCorrect: 0, lastEloDelta: null, lastRecordId: null,
-                isAdmin: Object.keys(fresh).length === 0,
+                role: Object.keys(fresh).length === 0 ? 'owner' : 'member',
                 createdAt: new Date().toISOString(),
             };
             // 같은 사번으로 거의 동시에 가입하면 먼저 저장된 사람만 남음
@@ -1217,6 +1299,42 @@ function BasketballClubApp() {
             setBusy(false);
         }
     };
+    // ----- 초대하기: 앱 설치 링크를 복사 -----
+    const inviteLink = () => `${window.location.origin}${window.location.pathname}`;
+    const inviteText = () => `[${CLUB_NAME}] 농구 동호회 앱에 초대해요!\n아래 링크를 열고 '설치'를 누르면 앱처럼 쓸 수 있어요.\n${inviteLink()}`;
+    const showToast = (msg) => {
+        setToast(msg);
+        clearTimeout(showToast.timer);
+        showToast.timer = setTimeout(() => setToast(''), 2500);
+    };
+    const handleInvite = async () => {
+        const text = inviteText();
+        try {
+            await navigator.clipboard.writeText(text);
+            showToast('초대 링크를 복사했어요. 카톡이나 메신저에 붙여넣어 보내세요.');
+            return;
+        }
+        catch (e) {
+            // 일부 브라우저는 자동 복사를 막아서, 예전 방식으로 한 번 더 시도
+        }
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand('copy');
+            ta.remove();
+            if (ok) {
+                showToast('초대 링크를 복사했어요. 카톡이나 메신저에 붙여넣어 보내세요.');
+                return;
+            }
+        }
+        catch (e) { /* 아래에서 직접 복사하도록 안내 */ }
+        setInviteFallback(text);
+    };
     const handleLogout = () => {
         localStorage.removeItem('currentPlayerId');
         setCurrentPlayerId(null);
@@ -1247,6 +1365,11 @@ function BasketballClubApp() {
     const cachedForCurrent = !!((_d = daily.teamCache) === null || _d === void 0 ? void 0 : _d[attendanceKey(attendeePlayers.map((p) => p.id))]);
     const more = moreNeeded(attendeePlayers.length);
     const myName = (me === null || me === void 0 ? void 0 : me.name) || currentPlayerId;
+    const currentSeason = currentSeasonOf(seasons);
+    // 지난 시즌 기록은 바꿀 수 없음 (시즌 번호가 없는 예전 기록은 시즌 1)
+    const isPastSeasonRecord = (r) => ((r === null || r === void 0 ? void 0 : r.season) || 1) < currentSeason.number;
+    // 이번 시즌 시작 전 날짜에는 새 기록을 넣을 수 없음
+    const viewBeforeSeason = !!currentSeason.startDate && viewDate < currentSeason.startDate;
     const lockedByOther = lockActive(editLock) && editLock.by !== currentPlayerId;
     const standings = Object.fromEntries(teamLabels.map((l) => [l, 0]));
     teamRecords.forEach((r) => {
@@ -1489,6 +1612,14 @@ function BasketballClubApp() {
         var _a;
         setError('');
         setLockNotice('');
+        if (record && isPastSeasonRecord(record)) {
+            setError('지난 시즌 기록은 바꿀 수 없어요.');
+            return;
+        }
+        if (!record && viewBeforeSeason) {
+            setError('이번 시즌 시작 전 날짜에는 기록을 넣을 수 없어요.');
+            return;
+        }
         if (record && record.fromTeams && ((_a = daily.predictionResult) === null || _a === void 0 ? void 0 : _a.finalized)) {
             setError('마감된 날의 오늘 팀끼리 기록은 관리자가 마감을 취소한 뒤에 수정할 수 있어요.');
             return;
@@ -1583,6 +1714,10 @@ function BasketballClubApp() {
         const existing = editingId ? (freshDaily.records || []).find((r) => r.id === editingId) : null;
         if (editingId && !existing)
             throw new Error('이 기록은 이미 삭제됐어요');
+        if (existing && isPastSeasonRecord(existing))
+            throw new Error('지난 시즌 기록은 바꿀 수 없어요');
+        if (!existing && viewBeforeSeason)
+            throw new Error('이번 시즌 시작 전 날짜에는 기록을 넣을 수 없어요');
         if (((_a = freshDaily.predictionResult) === null || _a === void 0 ? void 0 : _a.finalized) && (fromTeams || (existing === null || existing === void 0 ? void 0 : existing.fromTeams))) {
             throw new Error('마감된 날에는 오늘 팀끼리 기록을 추가하거나 수정할 수 없어요. 직접 구성으로 입력해주세요');
         }
@@ -1603,6 +1738,7 @@ function BasketballClubApp() {
         const record = {
             ...(existing || {}),
             id: recordId, date, sideA, sideB, games, winsA, winsB: games - winsA, fromTeams,
+            season: (existing === null || existing === void 0 ? void 0 : existing.season) || currentSeason.number,
             createdAt: (existing === null || existing === void 0 ? void 0 : existing.createdAt) || nowIso,
             enteredBy: (existing === null || existing === void 0 ? void 0 : existing.enteredBy) || myName,
             ...(existing ? { editedBy: myName, editedAt: nowIso } : {}),
@@ -1616,8 +1752,8 @@ function BasketballClubApp() {
             ])].filter((id) => nextPlayers[id]);
         const snapshot = (r) => ({ sideA: r.sideA, sideB: r.sideB, games: r.games, winsA: r.winsA, winsB: r.winsB, fromTeams: r.fromTeams });
         const logEntry = existing
-            ? { id: uniqueId(`edit-${date}`), type: 'record-edit', recordId, date, timestamp: nowIso, adminName: myName, before: snapshot(existing), after: snapshot(record), undone: false }
-            : { id: recordId, type: 'record', recordId, date, timestamp: nowIso, adminName: myName, labelA: sideA.label, labelB: sideB.label, games, winsA, winsB: games - winsA, fromTeams, playerDeltas: deltas, undone: false };
+            ? { id: uniqueId(`edit-${date}`), type: 'record-edit', recordId, date, season: record.season, timestamp: nowIso, adminName: myName, before: snapshot(existing), after: snapshot(record), undone: false }
+            : { id: recordId, type: 'record', recordId, date, season: record.season, timestamp: nowIso, adminName: myName, labelA: sideA.label, labelB: sideB.label, games, winsA, winsB: games - winsA, fromTeams, playerDeltas: deltas, undone: false };
         const ops = [
             { key: 'players', type: 'json', patches: playerFieldPatches(nextPlayers, touched, RECORD_FIELDS) },
             { key: dk, type: 'json', patches: [{ op: 'upsertById', path: ['records'], value: record }] },
@@ -1667,6 +1803,10 @@ function BasketballClubApp() {
         const entry = logs.find((l) => l.id === logId);
         if (!entry || entry.undone)
             return;
+        if ((entry.season || 1) < currentSeason.number) {
+            setError('지난 시즌 기록은 바꿀 수 없어요.');
+            return;
+        }
         setBusy(true);
         try {
             const ok = await acquireLock();
@@ -1692,70 +1832,92 @@ function BasketballClubApp() {
         }
     };
     // ----- 그날 경기 마감 + 승부예측 결과 확정 (읽기 1번 + 저장 1번) -----
+    // 단독 1위를 맞히면 1점, 공동 1위면 그 팀들 중 하나를 고른 사람에게 1 ÷ (공동 1위 팀 수)점
+    // 오늘 팀끼리 경기가 하나도 없으면 예측 없이 마감(무효)
+    // 같은 날을 두 번 마감하지 않도록 서버에서 "아직 마감 안 됐을 때만" 저장
+    const closeDay = async (date, { auto = false } = {}) => {
+        var _a, _b;
+        const dk = `daily:${date}`;
+        const fresh = await api.getMany(['players', dk, 'seasons']);
+        const freshDaily = parseJson(fresh[dk], emptyDaily());
+        if (((_a = freshDaily.predictionResult) === null || _a === void 0 ? void 0 : _a.finalized) || ((_b = freshDaily.result) === null || _b === void 0 ? void 0 : _b.finalized))
+            return { applied: false, reason: 'already' };
+        const season = currentSeasonOf(parseJson(fresh.seasons, null));
+        if (season.startDate && date < season.startDate)
+            return { applied: false, reason: 'past-season' };
+        const freshPlayers = await ensureMigrated(parsePlayers(fresh.players));
+        const labels = TEAM_LABELS.filter((l) => { var _a, _b; return (_b = (_a = freshDaily.teams) === null || _a === void 0 ? void 0 : _a[l]) === null || _b === void 0 ? void 0 : _b.length; });
+        const recs = (freshDaily.records || []).filter((r) => r.fromTeams);
+        if (!auto && !recs.length)
+            return { applied: false, reason: 'no-games' };
+        const st = Object.fromEntries(labels.map((l) => [l, 0]));
+        recs.forEach((r) => {
+            if (r.sideA.label in st)
+                st[r.sideA.label] += r.winsA;
+            if (r.sideB.label in st)
+                st[r.sideB.label] += r.winsB;
+        });
+        const noGames = !recs.length;
+        const max = labels.length ? Math.max(...labels.map((l) => st[l])) : 0;
+        const winners = noGames ? [] : labels.filter((l) => st[l] === max);
+        const predictionId = uniqueId(`pred-${date}`);
+        const nowIso = new Date().toISOString();
+        const by = auto ? '자동 마감' : myName;
+        const deltas = [];
+        const nextPlayers = { ...freshPlayers };
+        const predictors = [];
+        const ops = [];
+        if (!noGames) {
+            Object.entries(freshDaily.predictions || {}).forEach(([pid, pick]) => {
+                const pl = nextPlayers[pid];
+                if (!pl)
+                    return;
+                const credit = predictionCredit(pick, winners);
+                const stats = predictionStats(pl);
+                nextPlayers[pid] = {
+                    ...pl,
+                    predictionScore: r3((pl.predictionScore || 0) + credit),
+                    predTotal: stats.total + 1,
+                    predCorrect: r3(stats.correct + credit),
+                };
+                predictors.push(pid);
+                deltas.push({ playerId: pid, winsDelta: 0, lossesDelta: 0, predictionScoreDelta: credit, predTotalDelta: 1, predCorrectDelta: credit, eloDelta: 0 });
+                ops.push({
+                    key: `history:${pid}`, type: 'json', init: [],
+                    patches: [{ op: 'upsertById', value: { id: predictionId, kind: 'prediction', predictionId, date, season: season.number, predicted: pick, predictionCorrect: credit > 0, credit } }],
+                });
+            });
+            ops.push({ key: 'players', type: 'json', patches: playerFieldPatches(nextPlayers, predictors, ['predictionScore', 'predTotal', 'predCorrect']) });
+        }
+        const result = {
+            finalized: true, winners, void: noGames, reason: noGames ? 'no-games' : null,
+            credit: winners.length ? r3(1 / winners.length) : 0, standings: st, predictionId, timestamp: nowIso, auto, by,
+        };
+        ops.push({ key: dk, type: 'json', patches: [{ op: 'set', path: ['predictionResult'], value: result }] });
+        ops.push({
+            key: 'updateLog', type: 'json', init: [],
+            patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: predictionId, type: 'prediction', predictionId, date, season: season.number, timestamp: nowIso, adminName: by, winners, void: noGames, auto, playerDeltas: deltas, undone: false } }],
+        });
+        const returnKeys = ['players', `daily:${viewDate}`];
+        pendingRef.current += 1;
+        try {
+            const res = await api.batchIf(ops, returnKeys, [{ key: dk, path: ['predictionResult', 'finalized'], absent: true }]);
+            applyValues(res.values);
+            return { applied: res.applied };
+        }
+        finally {
+            pendingRef.current -= 1;
+        }
+    };
     const handleClosePredictions = async () => {
-        var _a;
         setError('');
         setBusy(true);
         try {
-            const date = viewDate;
-            const dk = `daily:${date}`;
-            const fresh = await api.getMany(['players', dk]);
-            const freshDaily = parseJson(fresh[dk], emptyDaily());
-            if ((_a = freshDaily.predictionResult) === null || _a === void 0 ? void 0 : _a.finalized)
-                return;
-            const freshPlayers = await ensureMigrated(parsePlayers(fresh.players));
-            const labels = TEAM_LABELS.filter((l) => { var _a, _b; return (_b = (_a = freshDaily.teams) === null || _a === void 0 ? void 0 : _a[l]) === null || _b === void 0 ? void 0 : _b.length; });
-            const recs = (freshDaily.records || []).filter((r) => r.fromTeams);
-            if (!recs.length) {
+            const r = await closeDay(viewDate);
+            if (r.reason === 'no-games')
                 setError('오늘 팀끼리 기록된 경기가 없어요.');
-                return;
-            }
-            const st = Object.fromEntries(labels.map((l) => [l, 0]));
-            recs.forEach((r) => {
-                if (r.sideA.label in st)
-                    st[r.sideA.label] += r.winsA;
-                if (r.sideB.label in st)
-                    st[r.sideB.label] += r.winsB;
-            });
-            const max = Math.max(...labels.map((l) => st[l]));
-            const winners = labels.filter((l) => st[l] === max);
-            const isVoid = winners.length !== 1; // 1위가 동률이면 예측은 무효
-            const predictionId = uniqueId(`pred-${date}`);
-            const deltas = [];
-            const nextPlayers = { ...freshPlayers };
-            const predictors = [];
-            const ops = [];
-            if (!isVoid) {
-                Object.entries(freshDaily.predictions || {}).forEach(([pid, pick]) => {
-                    const pl = nextPlayers[pid];
-                    if (!pl)
-                        return;
-                    const correct = pick === winners[0];
-                    const stats = predictionStats(pl);
-                    nextPlayers[pid] = {
-                        ...pl,
-                        predictionScore: (pl.predictionScore || 0) + (correct ? 1 : 0),
-                        predTotal: stats.total + 1,
-                        predCorrect: stats.correct + (correct ? 1 : 0),
-                    };
-                    predictors.push(pid);
-                    deltas.push({ playerId: pid, winsDelta: 0, lossesDelta: 0, predictionScoreDelta: correct ? 1 : 0, predTotalDelta: 1, predCorrectDelta: correct ? 1 : 0, eloDelta: 0 });
-                    ops.push({
-                        key: `history:${pid}`, type: 'json', init: [],
-                        patches: [{ op: 'upsertById', value: { id: predictionId, kind: 'prediction', predictionId, date, predicted: pick, predictionCorrect: correct } }],
-                    });
-                });
-                ops.push({ key: 'players', type: 'json', patches: playerFieldPatches(nextPlayers, predictors, ['predictionScore', 'predTotal', 'predCorrect']) });
-            }
-            ops.push({
-                key: dk, type: 'json',
-                patches: [{ op: 'set', path: ['predictionResult'], value: { finalized: true, winners, void: isVoid, standings: st, predictionId, timestamp: new Date().toISOString() } }],
-            });
-            ops.push({
-                key: 'updateLog', type: 'json', init: [],
-                patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: predictionId, type: 'prediction', predictionId, date, timestamp: new Date().toISOString(), adminName: myName, winners, void: isVoid, playerDeltas: deltas, undone: false } }],
-            });
-            await write(ops, ['players', dk]);
+            else if (r.reason === 'past-season')
+                setError('지난 시즌 날짜는 마감할 수 없어요.');
             setConfirmingClose(false);
         }
         catch (e) {
@@ -1765,6 +1927,41 @@ function BasketballClubApp() {
             setBusy(false);
         }
     };
+    // ----- 자동 마감: 마감하지 않은 지난 날(최근 2주, 이번 시즌)을 찾아서 마감 -----
+    // 오늘 팀끼리 경기 기록이 있는 지난 날만 마감해요. 단, 오늘 그날 기록을 입력하거나 고친 사람이 있으면
+    // (지난 경기 사후입력 중) 하루 더 기다렸다가 마감해요. force면 기다리지 않고 마감 (시즌 종료 때)
+    const autoCloseOpenDays = async ({ force = false } = {}) => {
+        if (!API_URL || API_URL.indexOf('PASTE_YOUR') === 0)
+            return 0;
+        const dates = [];
+        for (let i = 1; i <= 14; i++)
+            dates.push(shiftDate(dateKey, -i));
+        const values = await api.getMany(['seasons', ...dates.map((d) => `daily:${d}`)]);
+        const season = currentSeasonOf(parseJson(values.seasons, null));
+        const open = dates.filter((d) => {
+            var _a, _b;
+            if (season.startDate && d < season.startDate)
+                return false;
+            const day = parseJson(values[`daily:${d}`], null);
+            if (!day || !day.teams || ((_a = day.predictionResult) === null || _a === void 0 ? void 0 : _a.finalized) || ((_b = day.result) === null || _b === void 0 ? void 0 : _b.finalized))
+                return false;
+            const recs = day.records || [];
+            if (!recs.some((r) => r.fromTeams))
+                return false; // 팀끼리 경기가 없으면 정산할 것이 없음 (사후입력 가능하게 열어둠)
+            if (force)
+                return true;
+            const touchedToday = recs.some((r) => dateKeyOf(r.editedAt || r.createdAt || 0) >= dateKey);
+            return !touchedToday;
+        });
+        let closed = 0;
+        for (const d of open.sort()) {
+            const r = await closeDay(d, { auto: true });
+            if (r.applied)
+                closed += 1;
+        }
+        return closed;
+    };
+    autoCloseRef.current = autoCloseOpenDays;
     // ----- 업데이트 로그에서 취소/삭제 (읽기 1번 + 저장 1번) -----
     const handleUndo = async (logId) => {
         var _a;
@@ -1772,6 +1969,10 @@ function BasketballClubApp() {
         const entry = logs.find((l) => l.id === logId);
         if (!entry || entry.undone)
             return;
+        if ((entry.season || 1) < currentSeason.number) {
+            setError('지난 시즌 기록은 바꿀 수 없어요.');
+            return;
+        }
         const type = entry.type || 'legacy';
         setBusy(true);
         try {
@@ -1812,10 +2013,10 @@ function BasketballClubApp() {
                         ...pl,
                         wins: (pl.wins || 0) - (d.winsDelta || 0),
                         losses: (pl.losses || 0) - (d.lossesDelta || 0),
-                        predictionScore: (pl.predictionScore || 0) - (d.predictionScoreDelta || 0),
+                        predictionScore: r3((pl.predictionScore || 0) - (d.predictionScoreDelta || 0)),
                         elo: eloOf(pl) - (d.eloDelta || 0),
                         predTotal: stats.total - (isPred ? ((_a = d.predTotalDelta) !== null && _a !== void 0 ? _a : 1) : 0),
-                        predCorrect: stats.correct - (isPred ? ((_c = (_b = d.predCorrectDelta) !== null && _b !== void 0 ? _b : d.predictionScoreDelta) !== null && _c !== void 0 ? _c : 0) : 0),
+                        predCorrect: r3(stats.correct - (isPred ? ((_c = (_b = d.predCorrectDelta) !== null && _b !== void 0 ? _b : d.predictionScoreDelta) !== null && _c !== void 0 ? _c : 0) : 0)),
                     };
                     ids.push(d.playerId);
                     ops.push({
@@ -1840,25 +2041,6 @@ function BasketballClubApp() {
     };
     // 한 선수의 몇 칸만 바꾸기 (한 번 왕복, 다른 칸은 건드리지 않음)
     const patchPlayer = (id, fields) => write([{ key: 'players', type: 'json', patches: Object.entries(fields).map(([f, v]) => ({ op: 'set', path: [id, f], value: v })) }], ['players']);
-    const handleClaimAdmin = async () => {
-        setError('');
-        if (adminCodeInput !== ADMIN_CODE) {
-            setError('관리자 코드가 올바르지 않습니다.');
-            return;
-        }
-        setBusy(true);
-        try {
-            await patchPlayer(currentPlayerId, { isAdmin: true });
-            setShowAdminClaim(false);
-            setAdminCodeInput('');
-        }
-        catch (e) {
-            setError(`관리자 등록 중 문제가 발생했습니다. (${serverErrorText(e)})`);
-        }
-        finally {
-            setBusy(false);
-        }
-    };
     const handlePositionChange = async (newPos) => {
         const before = players;
         setPlayers((ps) => ({ ...ps, [currentPlayerId]: { ...ps[currentPlayerId], position: newPos } })); // 즉시 반영
@@ -1898,15 +2080,31 @@ function BasketballClubApp() {
         setMemberMsg('');
         const draft = memberDrafts[id] || {};
         const update = {};
-        if (draft.position !== undefined)
+        if (draft.position !== undefined) {
+            if (!can(me, 'editMembers')) {
+                setError('회원 정보를 바꿀 권한이 없어요.');
+                return;
+            }
             update.position = normalizePosition(draft.position);
+        }
         if (draft.height !== undefined) {
+            if (!can(me, 'editMembers')) {
+                setError('회원 정보를 바꿀 권한이 없어요.');
+                return;
+            }
             const h = validHeight(draft.height);
             if (h === null) {
                 setError(`키는 ${MIN_HEIGHT}~${MAX_HEIGHT} 사이 숫자(cm)로 입력해주세요.`);
                 return;
             }
             update.height = h;
+        }
+        if (draft.role !== undefined && draft.role !== roleOf(players[id])) {
+            if (!rolesAssignable(me, players[id]).includes(draft.role)) {
+                setError('이 권한으로 바꿀 수 없어요.');
+                return;
+            }
+            update.role = draft.role;
         }
         if (!Object.keys(update).length)
             return;
@@ -1915,6 +2113,15 @@ function BasketballClubApp() {
             if (!players[id]) {
                 setError('회원 정보를 찾을 수 없습니다.');
                 return;
+            }
+            if (update.role && roleOf(players[id]) === 'owner' && update.role !== 'owner') {
+                // 최종관리자는 항상 한 명 이상 남아 있어야 함 (최신 정보로 확인)
+                const fresh = parsePlayers((await api.getMany(['players'])).players);
+                const owners = Object.values(fresh).filter((p) => roleOf(p) === 'owner');
+                if (owners.length <= 1) {
+                    setError('최종관리자는 최소 한 명 있어야 해요. 다른 사람을 먼저 최종관리자로 지정해주세요.');
+                    return;
+                }
             }
             await patchPlayer(id, update);
             setMemberDrafts((d) => { const n = { ...d }; delete n[id]; return n; });
@@ -1926,6 +2133,107 @@ function BasketballClubApp() {
         finally {
             setBusy(false);
         }
+    };
+    // ----- 시즌 종료 -----
+    // 1) 마감 안 된 지난 날을 먼저 자동 마감  2) 오늘 경기가 열려 있으면 중단
+    // 3) 이번 시즌 기록(승패, Rating, 예측)을 시즌 보관함에 저장  4) 모두 처음 상태로 초기화하고 다음 시즌 시작
+    // 같은 시즌을 두 번 종료하지 않도록 서버에서 "아직 이 시즌일 때만" 저장
+    const handleEndSeason = async () => {
+        var _a;
+        setError('');
+        setSeasonMsg('');
+        if (!can(me, 'endSeason')) {
+            setError('시즌을 종료할 권한이 없어요.');
+            return;
+        }
+        setBusy(true);
+        try {
+            await autoCloseOpenDays({ force: true });
+            const fresh = await api.getMany(['players', 'seasons', `daily:${dateKey}`]);
+            const today = parseJson(fresh[`daily:${dateKey}`], emptyDaily());
+            if (today.teams && (today.records || []).some((r) => r.fromTeams) && !((_a = today.predictionResult) === null || _a === void 0 ? void 0 : _a.finalized)) {
+                setError('오늘 경기가 아직 마감되지 않았어요. 오늘 경기를 먼저 마감한 뒤 시즌을 종료해주세요.');
+                return;
+            }
+            const seasonsData = parseJson(fresh.seasons, null);
+            const cur = currentSeasonOf(seasonsData);
+            if (cur.number !== currentSeason.number) {
+                // 화면을 보는 사이 다른 사람이 이미 시즌을 종료함 → 다음 시즌을 실수로 종료하지 않도록 중단
+                setSeasons(seasonsData);
+                setConfirmingSeasonEnd(false);
+                setSeasonMsg(`이미 다른 사람이 시즌 ${currentSeason.number}${eulReul(currentSeason.number)} 종료했어요. 지금은 시즌 ${cur.number}${ieyo(cur.number)}.`);
+                return;
+            }
+            const freshPlayers = await ensureMigrated(parsePlayers(fresh.players));
+            const nowIso = new Date().toISOString();
+            const snapshotPlayers = {};
+            Object.values(freshPlayers).forEach((p) => {
+                const st = predictionStats(p);
+                snapshotPlayers[p.id] = {
+                    id: p.id, name: p.name, position: p.position,
+                    wins: p.wins || 0, losses: p.losses || 0, elo: eloOf(p),
+                    predTotal: st.total, predCorrect: st.correct, predictionScore: p.predictionScore || 0,
+                    lastEloDelta: lastEloDeltaOf(p),
+                };
+            });
+            const snapshot = { number: cur.number, startAt: cur.startAt, startDate: cur.startDate, endAt: nowIso, endDate: dateKey, endedBy: myName, players: snapshotPlayers };
+            const next = { number: cur.number + 1, startAt: nowIso, startDate: dateKey };
+            const reset = { wins: 0, losses: 0, elo: ELO_BASE, predictionScore: 0, predTotal: 0, predCorrect: 0, lastEloDelta: null, lastRecordId: null };
+            const ids = Object.keys(freshPlayers);
+            const ops = [
+                { key: `season:${cur.number}`, type: 'set', value: JSON.stringify(snapshot) },
+                { key: 'players', type: 'json', patches: ids.flatMap((id) => Object.entries(reset).map(([f, v]) => ({ op: 'set', path: [id, f], value: v }))) },
+                {
+                    key: 'seasons', type: 'json',
+                    patches: [
+                        { op: 'set', path: ['current'], value: next },
+                        { op: 'upsertById', path: ['past'], value: { id: `season-${cur.number}`, number: cur.number, startAt: cur.startAt, startDate: cur.startDate, endAt: nowIso, endDate: dateKey, endedBy: myName } },
+                    ],
+                },
+                {
+                    key: 'updateLog', type: 'json', init: [],
+                    patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: uniqueId('season-end'), type: 'season-end', date: dateKey, season: cur.number, timestamp: nowIso, adminName: myName, undone: true } }],
+                },
+            ];
+            const requires = cur.number === 1 && !(seasonsData === null || seasonsData === void 0 ? void 0 : seasonsData.current)
+                ? [{ key: 'seasons', path: ['current'], absent: true }]
+                : [{ key: 'seasons', path: ['current', 'number'], equals: cur.number }];
+            pendingRef.current += 1;
+            try {
+                const res = await api.batchIf(ops, ['players', 'seasons', 'updateLog'], requires);
+                applyValues(res.values);
+                setSeasonMsg(res.applied ? `시즌 ${cur.number}${eulReul(cur.number)} 마치고 시즌 ${cur.number + 1}${eulReul(cur.number + 1)} 시작했어요.` : '이미 다른 사람이 시즌을 종료했어요.');
+            }
+            finally {
+                pendingRef.current -= 1;
+            }
+            setConfirmingSeasonEnd(false);
+            setSeasonView(null);
+        }
+        catch (e) {
+            setError(`시즌 종료 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    // 지난 시즌 랭킹 보기: 보관된 기록 불러오기
+    const openSeasonView = async (n) => {
+        if (n === null) {
+            setSeasonView(null);
+            return;
+        }
+        if (!seasonSnapshots[n]) {
+            try {
+                const v = await api.getMany([`season:${n}`]);
+                setSeasonSnapshots((m) => ({ ...m, [n]: parseJson(v[`season:${n}`], null) }));
+            }
+            catch (e) {
+                setError(`지난 시즌 기록을 불러오지 못했어요. (${serverErrorText(e)})`);
+                return;
+            }
+        }
+        setSeasonView(n);
     };
     const handleChangePassword = async () => {
         setError('');
@@ -1977,7 +2285,8 @@ function BasketballClubApp() {
         try {
             const dailyKeys = await api.list('daily:');
             const historyKeys = await api.list('history:');
-            const values = await api.getMany(['players', 'updateLog', ...dailyKeys, ...historyKeys]);
+            const seasonKeys = await api.list('season:');
+            const values = await api.getMany(['players', 'updateLog', 'seasons', ...dailyKeys, ...historyKeys, ...seasonKeys]);
             const dailyData = {};
             dailyKeys.forEach((k) => { const v = parseJson(values[k], null); if (v)
                 dailyData[k.slice('daily:'.length)] = v; });
@@ -1991,6 +2300,8 @@ function BasketballClubApp() {
                 updateLog: parseJson(values.updateLog, []),
                 daily: dailyData,
                 history: histories,
+                seasons: parseJson(values.seasons, null),
+                seasonArchive: Object.fromEntries(seasonKeys.map((k) => [k.slice('season:'.length), parseJson(values[k], null)])),
             };
             setBackupText(JSON.stringify(backup));
             setBackupMsg(`백업 완료 (선수 ${Object.keys(backup.players).length}명, 경기기록 ${Object.keys(dailyData).length}일치)`);
@@ -2035,6 +2346,8 @@ function BasketballClubApp() {
                 { key: 'updateLog', type: 'set', value: JSON.stringify(parsed.updateLog || []) },
                 ...dailyEntries.map(([date, data]) => ({ key: `daily:${date}`, type: 'set', value: JSON.stringify(data) })),
                 ...Object.entries(parsed.history || {}).map(([id, h]) => ({ key: `history:${id}`, type: 'set', value: JSON.stringify(h) })),
+                ...(parsed.seasons ? [{ key: 'seasons', type: 'set', value: JSON.stringify(parsed.seasons) }] : []),
+                ...Object.entries(parsed.seasonArchive || {}).map(([n, v]) => ({ key: `season:${n}`, type: 'set', value: JSON.stringify(v) })),
             ];
             const values = await batchWithRetry(ops, ['players', 'updateLog', `daily:${viewDate}`]);
             // 예전 백업(선수 정보 안에 기록이 들어 있는 형식)이면 새 형식으로 나눠 저장
@@ -2060,7 +2373,12 @@ function BasketballClubApp() {
     // - 승률 랭킹: 윌슨 점수, 20경기 이상만 순위 (나머지는 '랭킹 진입 전'에 경기 수 많은 순)
     // - 적중률 랭킹: 윌슨 점수
     // - Rating 랭킹: 엘로 점수, 20경기 이상만 순위
-    const scoredPlayers = Object.values(players).map((p) => {
+    // 이번 시즌이면 지금 회원 기록, 지난 시즌이면 보관된 기록으로 랭킹 계산
+    const pastSeasons = [...((seasons === null || seasons === void 0 ? void 0 : seasons.past) || [])].sort((a, b) => b.number - a.number);
+    const viewingPast = seasonView !== null && !!seasonSnapshots[seasonView];
+    const rankSource = viewingPast ? (seasonSnapshots[seasonView].players || {}) : players;
+    const viewedSeasonNumber = viewingPast ? seasonView : currentSeason.number;
+    const scoredPlayers = Object.values(rankSource).map((p) => {
         const games = gamesPlayed(p);
         const pred = predictionStats(p);
         return {
@@ -2099,7 +2417,7 @@ function BasketballClubApp() {
         }
         else if (rankMode === 'prediction') {
             ranked = p.pred.total > 0;
-            detail = ranked ? `${p.pred.total}번 중 ${p.pred.correct}번 적중 · ${pct(p.pred.correct, p.pred.total)}` : '아직 예측 기록 없음';
+            detail = ranked ? `${p.pred.total}번 중 ${fmtNum(p.pred.correct)}점 · ${pct(p.pred.correct, p.pred.total)}` : '아직 예측 기록 없음';
             scoreLabel = ranked ? `${Math.round(p.predScore * 100)}점` : '-';
         }
         else {
@@ -2120,7 +2438,10 @@ function BasketballClubApp() {
         setRankImageBusy(true);
         try {
             const d = new Date();
-            const dateText = `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 기준`;
+            const snap = viewingPast ? seasonSnapshots[seasonView] : null;
+            const dateText = snap
+                ? `시즌 ${snap.number} 최종 · ${snap.startDate ? formatDateLabel(snap.startDate) : '처음'} ~ ${formatDateLabel(snap.endDate)}`
+                : `시즌 ${currentSeason.number} · ${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 기준`;
             const rule = rankMode === 'prediction'
                 ? '적중률과 예측 횟수를 함께 본 점수 순'
                 : rankMode === 'skill'
@@ -2138,7 +2459,7 @@ function BasketballClubApp() {
                 URL.revokeObjectURL(rankImage.url);
             // 파일 이름은 영문으로 (한글 파일 이름은 일부 휴대폰에서 'download'로 바뀌어 저장됨)
             const fileMode = { winrate: 'winrate', prediction: 'prediction', skill: 'rating' }[rankMode];
-            setRankImage({ url: URL.createObjectURL(blob), blob, fileName: `ranking-${fileMode}-${stamp.replace(/\./g, '')}.png` });
+            setRankImage({ url: URL.createObjectURL(blob), blob, fileName: `ranking-s${viewedSeasonNumber}-${fileMode}-${stamp.replace(/\./g, '')}.png` });
         }
         catch (e) {
             setError(`이미지를 만드는 중 문제가 발생했습니다. (${(e === null || e === void 0 ? void 0 : e.message) || '알 수 없는 오류'})`);
@@ -2179,9 +2500,20 @@ function BasketballClubApp() {
     const myGames = gamesPlayed(me);
     const myPred = predictionStats(me);
     const mySkill = Math.round(eloOf(me));
-    const myWinRankIdx = winRanking.findIndex((p) => p.id === currentPlayerId);
-    const myPredRankIdx = predRanking.findIndex((p) => p.id === currentPlayerId);
-    const mySkillRankIdx = skillRanking.findIndex((p) => p.id === currentPlayerId);
+    // 마이페이지 순위는 랭킹 화면에서 지난 시즌을 보고 있어도 항상 이번 시즌 기준
+    const curScored = viewingPast
+        ? Object.values(players).map((p) => {
+            const games = gamesPlayed(p);
+            const pred = predictionStats(p);
+            return { ...p, games, pred, winScore: wilsonScore(p.wins || 0, games), predScore: wilsonScore(pred.correct, pred.total), skill: eloOf(p) };
+        })
+        : scoredPlayers;
+    const curWin = viewingPast ? [...curScored].sort((a, b) => (qualifies(b) - qualifies(a)) || (hasGames(b) - hasGames(a)) || (b.winScore - a.winScore) || (b.games - a.games)) : winRanking;
+    const curPred = viewingPast ? [...curScored].sort((a, b) => (b.predScore - a.predScore) || (b.pred.total - a.pred.total)) : predRanking;
+    const curSkill = viewingPast ? [...curScored].sort((a, b) => (qualifies(b) - qualifies(a)) || (hasGames(b) - hasGames(a)) || (b.skill - a.skill) || (b.games - a.games)) : skillRanking;
+    const myWinRankIdx = curWin.findIndex((p) => p.id === currentPlayerId);
+    const myPredRankIdx = curPred.findIndex((p) => p.id === currentPlayerId);
+    const mySkillRankIdx = curSkill.findIndex((p) => p.id === currentPlayerId);
     const entryLabel = myGames > 0 ? `랭킹 진입까지 ${RANKING_MIN_GAMES - myGames}경기` : '아직 경기 기록 없음';
     const myWinRankLabel = myGames >= RANKING_MIN_GAMES && myWinRankIdx >= 0 ? `승률 랭킹 ${myWinRankIdx + 1}위` : entryLabel;
     const myPredRankLabel = myPred.total > 0 && myPredRankIdx >= 0 ? `적중률 랭킹 ${myPredRankIdx + 1}위` : '아직 예측 기록 없음';
@@ -2245,6 +2577,7 @@ function BasketballClubApp() {
                         React.createElement("div", { className: "w-8 h-8 rounded-lg bg-orange-600 flex items-center justify-center text-base" }, "\uD83C\uDFC0"),
                         React.createElement("h1", { className: "font-display text-lg text-white tracking-wide" }, CLUB_NAME)),
                     React.createElement("div", { className: "flex items-center gap-3" },
+                        React.createElement("button", { onClick: handleInvite, className: "text-xs font-bold text-white bg-orange-600 rounded-full px-3 py-1.5", "aria-label": "\uCD08\uB300\uD558\uAE30" }, "\uD83D\uDCE8 \uCD08\uB300\uD558\uAE30"),
                         React.createElement("button", { onClick: manualRefresh, className: "text-slate-400 text-lg", "aria-label": "\uC0C8\uB85C\uACE0\uCE68" }, "\uD83D\uDD04"),
                         React.createElement("button", { onClick: handleLogout, className: "text-slate-400 text-lg", "aria-label": "\uB85C\uADF8\uC544\uC6C3" }, "\uD83D\uDEAA"))),
                 React.createElement("button", { onClick: () => setTab('mypage'), className: "flex items-center gap-2 mt-4" },
@@ -2252,7 +2585,7 @@ function BasketballClubApp() {
                     React.createElement("div", { className: "text-left" },
                         React.createElement("p", { className: "text-white text-sm font-bold leading-tight" },
                             me.name,
-                            me.isAdmin && React.createElement("span", { className: "ml-1 text-xs text-orange-400 font-bold" }, "\uAD00\uB9AC\uC790")),
+                            rankOf(me) > 0 && React.createElement("span", { className: "ml-1 text-xs text-orange-400 font-bold" }, ROLE_LABEL[roleOf(me)])),
                         React.createElement("p", { className: "text-slate-400 text-xs font-medium" }, me.position)))),
             React.createElement("div", { className: "px-4 pt-4" },
                 error && (React.createElement("div", { className: "bg-red-50 text-red-600 text-xs font-medium px-3 py-2 rounded-lg mb-3" }, error)),
@@ -2379,18 +2712,30 @@ function BasketballClubApp() {
                                     "\uD45C",
                                     mine && ' · 내 예측')));
                         })),
-                        ((_e = daily.predictionResult) === null || _e === void 0 ? void 0 : _e.finalized) && (React.createElement("p", { className: "text-center text-xs font-bold mt-3" }, daily.predictionResult.void
-                            ? React.createElement("span", { className: "text-slate-400" }, "1\uC704\uAC00 \uB3D9\uB960\uC774\uB77C \uC774\uBC88 \uC608\uCE21\uC740 \uBB34\uD6A8 \uCC98\uB9AC\uB410\uC5B4\uC694")
-                            : ((_f = daily.predictions) === null || _f === void 0 ? void 0 : _f[currentPlayerId])
-                                ? (daily.predictions[currentPlayerId] === daily.predictionResult.winners[0]
-                                    ? React.createElement("span", { className: "text-emerald-600" }, "\uB0B4 \uC608\uCE21 \uC801\uC911! \uD83C\uDF89")
-                                    : React.createElement("span", { className: "text-slate-400" }, "\uB0B4 \uC608\uCE21\uC740 \uBE57\uB098\uAC14\uC5B4\uC694"))
-                                : React.createElement("span", { className: "text-slate-400" }, "\uC774\uBC88\uC5D0\uB294 \uC608\uCE21\uD558\uC9C0 \uC54A\uC558\uC5B4\uC694"))))),
-                    ((_g = daily.predictionResult) === null || _g === void 0 ? void 0 : _g.finalized) && !daily.predictionResult.void && (React.createElement("div", { className: `rounded-2xl p-4 text-center ${((_h = TEAM_STYLE[daily.predictionResult.winners[0]]) === null || _h === void 0 ? void 0 : _h.tone) || 'bg-slate-900'}` },
-                        React.createElement("p", { className: "text-white text-xs font-bold opacity-80" }, "\uC624\uB298 \uACBD\uAE30 \uB9C8\uAC10"),
-                        React.createElement("p", { className: "font-display text-2xl text-white mt-0.5" },
-                            daily.predictionResult.winners[0],
-                            "\uD300 \uCD5C\uB2E4\uC2B9"),
+                        ((_e = daily.predictionResult) === null || _e === void 0 ? void 0 : _e.finalized) && (React.createElement("p", { className: "text-center text-xs font-bold mt-3" }, (() => {
+                            var _a;
+                            const pr = daily.predictionResult;
+                            const pick = (_a = daily.predictions) === null || _a === void 0 ? void 0 : _a[currentPlayerId];
+                            if (pr.void)
+                                return React.createElement("span", { className: "text-slate-400" }, "\uC624\uB298 \uD300\uB07C\uB9AC \uACBD\uAE30\uAC00 \uC5C6\uC5B4\uC11C \uC608\uCE21 \uC5C6\uC774 \uB9C8\uAC10\uB410\uC5B4\uC694");
+                            if (!pick)
+                                return React.createElement("span", { className: "text-slate-400" }, "\uC774\uBC88\uC5D0\uB294 \uC608\uCE21\uD558\uC9C0 \uC54A\uC558\uC5B4\uC694");
+                            const credit = predictionCredit(pick, pr.winners);
+                            if (credit >= 1)
+                                return React.createElement("span", { className: "text-emerald-600" }, "\uB0B4 \uC608\uCE21 \uC801\uC911! 1\uC810 \uD83C\uDF89");
+                            if (credit > 0)
+                                return React.createElement("span", { className: "text-emerald-600" },
+                                    "\uACF5\uB3D9 1\uC704\uB97C \uB9DE\uD600\uC11C ",
+                                    fmtNum(credit),
+                                    "\uC810\uC744 \uBC1B\uC558\uC5B4\uC694");
+                            return React.createElement("span", { className: "text-slate-400" }, "\uB0B4 \uC608\uCE21\uC740 \uBE57\uB098\uAC14\uC5B4\uC694");
+                        })())))),
+                    ((_f = daily.predictionResult) === null || _f === void 0 ? void 0 : _f.finalized) && !daily.predictionResult.void && (React.createElement("div", { className: `rounded-2xl p-4 text-center ${daily.predictionResult.winners.length === 1 ? (((_g = TEAM_STYLE[daily.predictionResult.winners[0]]) === null || _g === void 0 ? void 0 : _g.tone) || 'bg-slate-900') : 'bg-slate-900'}` },
+                        React.createElement("p", { className: "text-white text-xs font-bold opacity-80" },
+                            isToday ? '오늘' : '그날',
+                            " \uACBD\uAE30 \uB9C8\uAC10",
+                            daily.predictionResult.auto ? ' (자동)' : ''),
+                        React.createElement("p", { className: "font-display text-2xl text-white mt-0.5" }, daily.predictionResult.winners.length === 1 ? `${daily.predictionResult.winners[0]}팀 최다승` : `${daily.predictionResult.winners.join('·')}팀 공동 1위`),
                         React.createElement("p", { className: "text-white text-xs mt-1 opacity-80" }, Object.entries(daily.predictionResult.standings || {}).map(([l, w]) => `${l} ${w}승`).join(' · ')))),
                     legacyFinal && (React.createElement("div", { className: `rounded-2xl p-4 text-center ${daily.result.winner === 'A' ? 'bg-blue-600' : 'bg-orange-600'}` },
                         React.createElement("p", { className: "text-white text-xs font-bold opacity-80" }, "\uACBD\uAE30 \uC885\uB8CC"),
@@ -2418,7 +2763,7 @@ function BasketballClubApp() {
                                             r.winsA,
                                             " : ",
                                             r.winsB),
-                                        !showRecordForm && !(r.fromTeams && ((_a = daily.predictionResult) === null || _a === void 0 ? void 0 : _a.finalized)) && (React.createElement("button", { onClick: () => openRecordForm(r), disabled: busy || lockedByOther, className: "text-xs font-bold text-slate-500 bg-white border border-slate-200 rounded-full px-2 py-0.5 disabled:opacity-40" }, "\uC218\uC815")))),
+                                        !showRecordForm && !(r.fromTeams && ((_a = daily.predictionResult) === null || _a === void 0 ? void 0 : _a.finalized)) && !isPastSeasonRecord(r) && (React.createElement("button", { onClick: () => openRecordForm(r), disabled: busy || lockedByOther, className: "text-xs font-bold text-slate-500 bg-white border border-slate-200 rounded-full px-2 py-0.5 disabled:opacity-40" }, "\uC218\uC815")))),
                                 React.createElement("p", { className: "text-xs text-slate-400 mt-0.5" },
                                     r.games,
                                     "\uD310 \u00B7 \uC785\uB825 ",
@@ -2435,7 +2780,8 @@ function BasketballClubApp() {
                         !showRecordForm && (lockedByOther || lockNotice) && (React.createElement("p", { className: "mt-3 text-xs font-bold text-amber-700 bg-amber-50 rounded-lg px-3 py-2" },
                             "\u270D\uFE0F \uB2E4\uB978 \uC0AC\uB78C\uC774 \uC785\uB825\uC911\uC785\uB2C8\uB2E4.",
                             lockedByOther && (editLock === null || editLock === void 0 ? void 0 : editLock.name) ? ` (${editLock.name}님)` : '')),
-                        !showRecordForm && (React.createElement("button", { onClick: () => openRecordForm(), disabled: busy || lockedByOther, className: "w-full mt-3 bg-slate-900 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-40" }, "+ \uACBD\uAE30 \uACB0\uACFC \uC785\uB825")),
+                        viewBeforeSeason && (React.createElement("p", { className: "mt-3 text-xs text-slate-400" }, "\uC9C0\uB09C \uC2DC\uC98C \uB0A0\uC9DC\uB77C \uAE30\uB85D\uC744 \uB123\uAC70\uB098 \uACE0\uCE60 \uC218 \uC5C6\uC5B4\uC694.")),
+                        !showRecordForm && !viewBeforeSeason && (React.createElement("button", { onClick: () => openRecordForm(), disabled: busy || lockedByOther, className: "w-full mt-3 bg-slate-900 text-white rounded-xl py-2.5 text-sm font-bold disabled:opacity-40" }, "+ \uACBD\uAE30 \uACB0\uACFC \uC785\uB825")),
                         showRecordForm && (() => {
                             const canUseTeams = teamLabels.length >= 2 && !dayClosed;
                             const mode = canUseTeams ? recMode : 'custom';
@@ -2536,23 +2882,40 @@ function BasketballClubApp() {
                                         React.createElement("button", { onClick: () => setConfirmingRecord(false), className: "py-2 rounded-lg text-sm font-bold text-slate-500 bg-white" }, "\uCDE8\uC18C"),
                                         React.createElement("button", { onClick: handleSaveRecord, disabled: busy, className: "py-2 rounded-lg text-sm font-bold text-white bg-slate-900" }, editingRecordId ? '수정' : '저장'))))));
                         })(),
-                        me.isAdmin && !showRecordForm && teamRecords.length > 0 && !((_j = daily.predictionResult) === null || _j === void 0 ? void 0 : _j.finalized) && (!confirmingClose ? (React.createElement("button", { onClick: () => setConfirmingClose(true), className: "w-full mt-2 border border-slate-200 text-slate-700 rounded-xl py-2.5 text-sm font-bold" },
+                        can(me, 'closeDay') && !showRecordForm && teamRecords.length > 0 && !((_h = daily.predictionResult) === null || _h === void 0 ? void 0 : _h.finalized) && !viewBeforeSeason && (!confirmingClose ? (React.createElement("button", { onClick: () => setConfirmingClose(true), className: "w-full mt-2 border border-slate-200 text-slate-700 rounded-xl py-2.5 text-sm font-bold" },
                             isToday ? '오늘' : '그날',
                             " \uACBD\uAE30 \uB9C8\uAC10 (\uC608\uCE21 \uACB0\uACFC \uD655\uC815)")) : (React.createElement("div", { className: "bg-slate-50 rounded-xl p-3 mt-2 text-center" },
                             React.createElement("p", { className: "text-sm font-bold text-slate-700 mb-1" }, leaders.length === 1
-                                ? `${leaders[0]}팀이 ${topWins}승으로 1위예요.`
-                                : `${leaders.join(', ')}팀이 ${topWins}승으로 동률이라 예측은 무효 처리돼요.`),
+                                ? `${leaders[0]}팀이 ${topWins}승으로 1위예요. 맞힌 사람은 1점`
+                                : `${leaders.join(', ')}팀이 ${topWins}승으로 공동 1위예요. 이 팀들을 고른 사람은 ${fmtNum(1 / leaders.length)}점`),
                             React.createElement("p", { className: "text-xs text-slate-400 mb-3" }, "\uB9C8\uAC10\uD558\uBA74 \uCD9C\uC11D\uACFC \uC608\uCE21\uC774 \uB2EB\uD788\uACE0, \uC624\uB298 \uD300\uB07C\uB9AC \uAE30\uB85D\uC740 \uB354 \uCD94\uAC00\uD560 \uC218 \uC5C6\uC5B4\uC694."),
                             React.createElement("div", { className: "grid grid-cols-2 gap-2" },
                                 React.createElement("button", { onClick: () => setConfirmingClose(false), className: "py-2 rounded-lg text-sm font-bold text-slate-500 bg-white" }, "\uCDE8\uC18C"),
-                                React.createElement("button", { onClick: handleClosePredictions, disabled: busy, className: "py-2 rounded-lg text-sm font-bold text-white bg-slate-900" }, "\uB9C8\uAC10"))))))))),
+                                React.createElement("button", { onClick: handleClosePredictions, disabled: busy, className: "py-2 rounded-lg text-sm font-bold text-white bg-slate-900" }, "\uB9C8\uAC10"))))),
+                        teamRecords.length > 0 && !((_j = daily.predictionResult) === null || _j === void 0 ? void 0 : _j.finalized) && (React.createElement("p", { className: "text-xs text-slate-400 mt-2 text-center" }, "\uAD00\uB9AC\uC790\uAC00 \uB9C8\uAC10\uD558\uC9C0 \uC54A\uC73C\uBA74 \uB2E4\uC74C \uB0A0 \uC790\uB3D9\uC73C\uB85C \uB9C8\uAC10\uB3FC\uC694.")))))),
                 tab === 'ranking' && (React.createElement("div", { className: "space-y-3" },
+                    pastSeasons.length > 0 && (React.createElement("div", { className: "flex gap-2 overflow-x-auto pb-1" },
+                        React.createElement("button", { onClick: () => openSeasonView(null), className: `shrink-0 px-3 py-1.5 rounded-full text-xs font-bold border ${!viewingPast ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-500 bg-white'}` },
+                            "\uC2DC\uC98C ",
+                            currentSeason.number,
+                            " (\uC774\uBC88 \uC2DC\uC98C)"),
+                        pastSeasons.map((ps) => (React.createElement("button", { key: ps.number, onClick: () => openSeasonView(ps.number), className: `shrink-0 px-3 py-1.5 rounded-full text-xs font-bold border ${viewingPast && seasonView === ps.number ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-500 bg-white'}` },
+                            "\uC2DC\uC98C ",
+                            ps.number))))),
+                    viewingPast && (React.createElement("p", { className: "text-xs font-bold text-slate-500 px-1" },
+                        "\uC2DC\uC98C ",
+                        seasonView,
+                        " \uCD5C\uC885 \uAE30\uB85D (",
+                        seasonSnapshots[seasonView].startDate ? formatDateLabel(seasonSnapshots[seasonView].startDate) : '처음',
+                        " ~ ",
+                        formatDateLabel(seasonSnapshots[seasonView].endDate),
+                        ")")),
                     React.createElement("div", { className: "flex rounded-lg bg-slate-100 p-1" }, [['winrate', '승률 랭킹'], ['prediction', '적중률 랭킹'], ['skill', 'Rating']].map(([mode, label]) => (React.createElement("button", { key: mode, onClick: () => setRankMode(mode), className: `flex-1 py-2 rounded-md text-xs font-bold ${rankMode === mode ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}` }, label)))),
                     React.createElement("p", { className: "text-xs text-slate-400 leading-relaxed px-1" },
                         rankMode === 'skill' && `팀 전력까지 고려한 Rating 순이에요. 예상보다 잘하면 오르고 못하면 내려가요. ${RANKING_MIN_GAMES}경기 이상 뛴 사람만 순위에 들어가요.`,
                         rankMode === 'winrate' && `승률과 판수를 함께 보고 매긴 점수 순이에요. 판수가 적으면 점수가 낮게 나오고, 기록이 쌓일수록 실제 승률에 가까워져요. ${RANKING_MIN_GAMES}경기 이상 뛴 사람만 순위에 들어가요.`,
                         rankMode === 'prediction' && '적중률과 예측 횟수를 함께 보고 매긴 점수 순이에요. 예측 횟수가 적으면 점수가 낮게 나오고, 기록이 쌓일수록 실제 적중률에 가까워져요.'),
-                    React.createElement("button", { onClick: handleMakeRankingImage, disabled: rankImageBusy || rankingRows.length === 0, className: "w-full bg-white border border-slate-200 rounded-xl py-2.5 text-sm font-bold text-slate-700 shadow-sm disabled:opacity-40" }, rankImageBusy ? '이미지 만드는 중...' : `📷 ${RANK_TITLES[rankMode]} 이미지로 저장`),
+                    React.createElement("button", { onClick: handleMakeRankingImage, disabled: rankImageBusy || rankingRows.length === 0, className: "w-full bg-white border border-slate-200 rounded-xl py-2.5 text-sm font-bold text-slate-700 shadow-sm disabled:opacity-40" }, rankImageBusy ? '이미지 만드는 중...' : `📷 시즌 ${viewedSeasonNumber} ${RANK_TITLES[rankMode]} 이미지로 저장`),
                     React.createElement("div", { className: "bg-white rounded-2xl shadow-sm divide-y divide-slate-100" },
                         rankingRows.length === 0 && React.createElement("p", { className: "text-slate-400 text-xs p-4 text-center" }, "\uB4F1\uB85D\uB41C \uC120\uC218\uAC00 \uC5C6\uC5B4\uC694."),
                         rankingRows.map((r, idx) => {
@@ -2579,7 +2942,7 @@ function BasketballClubApp() {
                             React.createElement("div", { className: "flex-1 min-w-0" },
                                 React.createElement("p", { className: "text-slate-800 font-bold text-base flex items-center gap-1.5 truncate" },
                                     me.name,
-                                    me.isAdmin && React.createElement("span", { className: "text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0" }, "\uAD00\uB9AC\uC790")),
+                                    rankOf(me) > 0 && React.createElement("span", { className: "text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0" }, ROLE_LABEL[roleOf(me)])),
                                 React.createElement("p", { className: "text-slate-400 text-xs font-medium" },
                                     "\uC0AC\uBC88 ",
                                     me.employeeId))),
@@ -2598,7 +2961,9 @@ function BasketballClubApp() {
                                 heightDraft !== null && heightDraft !== String(me.height || '') && (React.createElement("button", { onClick: handleHeightSave, disabled: busy, className: "text-xs font-bold text-white bg-orange-600 rounded-lg px-2.5 py-1.5 disabled:opacity-60" }, "\uC800\uC7A5"))))),
                     React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm flex items-center justify-between" },
                         React.createElement("div", null,
-                            React.createElement("p", { className: "text-xs text-slate-400 font-bold" }, "Rating"),
+                            React.createElement("p", { className: "text-xs text-slate-400 font-bold" },
+                                "Rating \u00B7 \uC2DC\uC98C ",
+                                currentSeason.number),
                             React.createElement("p", { className: "text-2xl font-black text-slate-800 mt-1" }, myGames > 0 ? mySkill : '-')),
                         React.createElement("div", { className: "text-right" },
                             React.createElement("p", { className: "text-xs text-orange-600 font-bold" }, mySkillRankLabel),
@@ -2610,7 +2975,9 @@ function BasketballClubApp() {
                                 "\uACBD\uAE30")))),
                     React.createElement("div", { className: "grid grid-cols-2 gap-3" },
                         React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
-                            React.createElement("p", { className: "text-xs text-slate-400 font-bold" }, "\uC2B9\uB960"),
+                            React.createElement("p", { className: "text-xs text-slate-400 font-bold" },
+                                "\uC2B9\uB960 \u00B7 \uC2DC\uC98C ",
+                                currentSeason.number),
                             React.createElement("p", { className: "text-2xl font-black text-slate-800 mt-1" }, pct(me.wins || 0, myGames)),
                             React.createElement("p", { className: "text-xs text-slate-500 font-medium mt-1" },
                                 me.wins || 0,
@@ -2619,13 +2986,15 @@ function BasketballClubApp() {
                                 "\uD328"),
                             React.createElement("p", { className: "text-xs text-orange-600 font-bold mt-0.5" }, myWinRankLabel)),
                         React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
-                            React.createElement("p", { className: "text-xs text-slate-400 font-bold" }, "\uC801\uC911\uB960"),
+                            React.createElement("p", { className: "text-xs text-slate-400 font-bold" },
+                                "\uC801\uC911\uB960 \u00B7 \uC2DC\uC98C ",
+                                currentSeason.number),
                             React.createElement("p", { className: "text-2xl font-black text-slate-800 mt-1" }, pct(myPred.correct, myPred.total)),
                             React.createElement("p", { className: "text-xs text-slate-500 font-medium mt-1" },
                                 myPred.total,
                                 "\uBC88 \uC911 ",
-                                myPred.correct,
-                                "\uBC88 \uC801\uC911"),
+                                fmtNum(myPred.correct),
+                                "\uC810"),
                             React.createElement("p", { className: "text-xs text-orange-600 font-bold mt-0.5" }, myPredRankLabel))),
                     React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
                         React.createElement("button", { onClick: () => { setShowChangePassword((v) => !v); setPwChangeMsg(''); setError(''); }, className: "w-full flex items-center justify-between" },
@@ -2637,13 +3006,6 @@ function BasketballClubApp() {
                             React.createElement("input", { type: "password", value: newPassword, onChange: (e) => setNewPassword(e.target.value), placeholder: "\uC0C8 \uBE44\uBC00\uBC88\uD638 (4\uC790 \uC774\uC0C1)", className: "w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" }),
                             React.createElement("input", { type: "password", value: newPasswordConfirm, onChange: (e) => setNewPasswordConfirm(e.target.value), placeholder: "\uC0C8 \uBE44\uBC00\uBC88\uD638 \uD655\uC778", className: "w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" }),
                             React.createElement("button", { onClick: handleChangePassword, disabled: busy, className: "w-full bg-slate-900 text-white rounded-lg py-2.5 text-sm font-bold flex items-center justify-center disabled:opacity-60" }, busy ? React.createElement(Spinner, { size: 16 }) : '변경하기')))),
-                    !me.isAdmin && (React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
-                        React.createElement("button", { onClick: () => setShowAdminClaim((v) => !v), className: "w-full flex items-center justify-between" },
-                            React.createElement("span", { className: "text-slate-800 font-bold text-sm" }, "\uAD00\uB9AC\uC790 \uB4F1\uB85D"),
-                            React.createElement("span", { className: "text-slate-400 text-xs font-medium" }, showAdminClaim ? '접기' : '코드 입력')),
-                        showAdminClaim && (React.createElement("div", { className: "flex gap-2 mt-3" },
-                            React.createElement("input", { value: adminCodeInput, onChange: (e) => setAdminCodeInput(e.target.value), placeholder: "\uAD00\uB9AC\uC790 \uCF54\uB4DC", className: "flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" }),
-                            React.createElement("button", { onClick: handleClaimAdmin, className: "bg-orange-600 text-white text-xs font-bold px-3 rounded-lg" }, "\uD655\uC778"))))),
                     !isStandaloneApp() && (React.createElement("button", { onClick: openInstallPrompt, className: "w-full bg-white rounded-2xl p-4 shadow-sm flex items-center justify-between" },
                         React.createElement("span", { className: "text-slate-800 font-bold text-sm" }, "\uD83D\uDCF2 \uC571\uC73C\uB85C \uC124\uCE58\uD558\uAE30"),
                         React.createElement("span", { className: "text-slate-400 text-xs font-medium" }, "\uD648 \uD654\uBA74\uC5D0 \uCD94\uAC00"))),
@@ -2653,8 +3015,9 @@ function BasketballClubApp() {
                             let sub;
                             let right;
                             if (h.kind === 'prediction') {
+                                const credit = typeof h.credit === 'number' ? h.credit : (h.predictionCorrect ? 1 : 0);
                                 sub = `승부예측 · ${h.predicted}팀 선택`;
-                                right = (React.createElement("span", { className: `text-xs font-bold px-2 py-0.5 rounded ${h.predictionCorrect ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}` }, h.predictionCorrect ? '적중' : '실패'));
+                                right = (React.createElement("span", { className: `text-xs font-bold px-2 py-0.5 rounded ${credit > 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}` }, credit >= 1 ? '적중' : credit > 0 ? `공동 1위 ${fmtNum(credit)}점` : '실패'));
                             }
                             else if (h.kind === 'record') {
                                 sub = `${sideName(h.team)} vs ${sideName(h.opponent)} · ${h.wins + h.losses}판${h.manual ? ' · 직접 구성' : ''}`;
@@ -2669,26 +3032,64 @@ function BasketballClubApp() {
                                 sub = `${h.team ? `${h.team}팀 출전` : '미출전'}${h.predicted ? ` · ${h.predicted}팀 예측 ${h.predictionCorrect ? '적중' : '실패'}` : ''}`;
                                 right = h.result ? (React.createElement("span", { className: `text-xs font-bold px-2 py-0.5 rounded ${h.result === 'win' ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}` }, h.result === 'win' ? '승' : '패')) : null;
                             }
-                            return (React.createElement("div", { key: idx, className: "flex items-center justify-between px-4 py-2.5" },
-                                React.createElement("div", { className: "min-w-0" },
-                                    React.createElement("p", { className: "text-sm font-semibold text-slate-700" }, formatDateLabel(h.date)),
-                                    React.createElement("p", { className: "text-xs text-slate-400 mt-0.5" }, sub)),
-                                React.createElement("div", { className: "text-right shrink-0" },
-                                    right,
-                                    typeof h.eloDelta === 'number' && (React.createElement("p", { className: "text-xs text-slate-400 font-medium mt-1" },
-                                        "Rating ",
-                                        h.eloDelta >= 0 ? '+' : '',
-                                        Math.round(h.eloDelta))))));
+                            // 시즌이 바뀌는 곳에 구분선 (시즌 번호가 없는 예전 기록은 시즌 1)
+                            const hs = h.season || 1;
+                            const prev = idx > 0 ? (sortedHistory[idx - 1].season || 1) : null;
+                            const showSeason = pastSeasons.length > 0 && hs !== prev;
+                            return (React.createElement(React.Fragment, { key: idx },
+                                showSeason && React.createElement("p", { className: "px-4 py-1.5 bg-slate-50 text-xs font-bold text-slate-400" },
+                                    "\uC2DC\uC98C ",
+                                    hs,
+                                    hs === currentSeason.number ? ' (이번 시즌)' : ''),
+                                React.createElement("div", { className: "flex items-center justify-between px-4 py-2.5" },
+                                    React.createElement("div", { className: "min-w-0" },
+                                        React.createElement("p", { className: "text-sm font-semibold text-slate-700" }, formatDateLabel(h.date)),
+                                        React.createElement("p", { className: "text-xs text-slate-400 mt-0.5" }, sub)),
+                                    React.createElement("div", { className: "text-right shrink-0" },
+                                        right,
+                                        typeof h.eloDelta === 'number' && (React.createElement("p", { className: "text-xs text-slate-400 font-medium mt-1" },
+                                            "Rating ",
+                                            h.eloDelta >= 0 ? '+' : '',
+                                            Math.round(h.eloDelta)))))));
                         }))),
                         sortedHistory.length > historyShowCount && (React.createElement("button", { onClick: () => setHistoryShowCount((n) => n + 10), className: "w-full py-3 text-xs font-bold text-slate-500 border-t border-slate-100" }, "\uB354 \uBCF4\uAE30"))))),
-                tab === 'admin' && me.isAdmin && (React.createElement("div", { className: "space-y-3" },
+                tab === 'admin' && can(me, 'closeDay') && (React.createElement("div", { className: "space-y-3" },
+                    React.createElement("p", { className: "text-xs text-slate-400 px-1" },
+                        "\uB0B4 \uAD8C\uD55C: ",
+                        React.createElement("span", { className: "font-bold text-slate-600" }, ROLE_LABEL[roleOf(me)])),
+                    can(me, 'endSeason') && (React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
+                        React.createElement("p", { className: "text-slate-800 font-bold text-sm" }, "\uC2DC\uC98C \uAD00\uB9AC"),
+                        React.createElement("p", { className: "text-slate-500 text-xs mt-1" },
+                            "\uC9C0\uAE08\uC740 ",
+                            React.createElement("span", { className: "font-bold text-slate-700" },
+                                "\uC2DC\uC98C ",
+                                currentSeason.number),
+                            currentSeason.startDate ? ` (${formatDateLabel(currentSeason.startDate)}부터)` : ''),
+                        seasonMsg && React.createElement("p", { className: "text-emerald-600 text-xs font-medium mt-2" }, seasonMsg),
+                        !confirmingSeasonEnd ? (React.createElement("button", { onClick: () => { setConfirmingSeasonEnd(true); setSeasonMsg(''); }, className: "w-full mt-3 border border-red-200 text-red-600 rounded-xl py-2.5 text-sm font-bold" },
+                            "\uC2DC\uC98C ",
+                            currentSeason.number,
+                            " \uC885\uB8CC\uD558\uAE30")) : (React.createElement("div", { className: "bg-red-50 rounded-xl p-3 mt-3" },
+                            React.createElement("p", { className: "text-red-700 text-sm font-bold mb-2" },
+                                "\uC2DC\uC98C ",
+                                currentSeason.number,
+                                eulReul(currentSeason.number),
+                                " \uC885\uB8CC\uD560\uAE4C\uC694?"),
+                            React.createElement("ul", { className: "text-xs text-red-700 space-y-1 mb-3 list-disc pl-4" },
+                                React.createElement("li", null, "\uC774\uBC88 \uC2DC\uC98C \uC2B9\uB960, \uC801\uC911\uB960, Rating \uAE30\uB85D\uC740 '\uC9C0\uB09C \uC2DC\uC98C'\uC73C\uB85C \uBCF4\uAD00\uB3FC\uC694."),
+                                React.createElement("li", null, "\uBAA8\uB4E0 \uD68C\uC6D0\uC758 \uC2B9\uD328, \uC608\uCE21 \uC810\uC218\uAC00 0\uC73C\uB85C, Rating\uC774 1500\uC73C\uB85C \uCD08\uAE30\uD654\uB3FC\uC694."),
+                                React.createElement("li", null, "\uB9C8\uAC10 \uC548 \uB41C \uC9C0\uB09C \uB0A0\uC740 \uBA3C\uC800 \uC790\uB3D9 \uB9C8\uAC10\uB3FC\uC694. \uC624\uB298 \uACBD\uAE30\uAC00 \uC5F4\uB824 \uC788\uC73C\uBA74 \uBA3C\uC800 \uB9C8\uAC10\uD574\uC57C \uD574\uC694."),
+                                React.createElement("li", null, "\uC885\uB8CC \uD6C4\uC5D0\uB294 \uB418\uB3CC\uB9B4 \uC218 \uC5C6\uC5B4\uC694. \uD639\uC2DC \uBAA8\uB974\uB2C8 \uC544\uB798 \uBC31\uC5C5\uC744 \uBA3C\uC800 \uB9CC\uB4E4\uC5B4\uB450\uC138\uC694.")),
+                            React.createElement("div", { className: "grid grid-cols-2 gap-2" },
+                                React.createElement("button", { onClick: () => setConfirmingSeasonEnd(false), className: "py-2 rounded-lg text-sm font-bold text-slate-500 bg-white" }, "\uCDE8\uC18C"),
+                                React.createElement("button", { onClick: handleEndSeason, disabled: busy, className: "py-2 rounded-lg text-sm font-bold text-white bg-red-600 disabled:opacity-50" }, "\uC2DC\uC98C \uC885\uB8CC")))))),
                     React.createElement("div", { className: "bg-white rounded-2xl shadow-sm overflow-hidden" },
                         React.createElement("div", { className: "p-4 pb-3" },
                             React.createElement("p", { className: "text-slate-800 font-bold text-sm" },
                                 "\uD68C\uC6D0 \uAD00\uB9AC (",
                                 Object.keys(players).length,
                                 "\uBA85)"),
-                            React.createElement("p", { className: "text-slate-400 text-xs mt-0.5" }, "\uD3EC\uC9C0\uC158\uACFC \uD0A4\uB97C \uBC14\uAFB8\uACE0 \uC800\uC7A5\uC744 \uB204\uB974\uC138\uC694."),
+                            React.createElement("p", { className: "text-slate-400 text-xs mt-0.5" }, "\uD3EC\uC9C0\uC158, \uD0A4, \uAD8C\uD55C\uC744 \uBC14\uAFB8\uACE0 \uC800\uC7A5\uC744 \uB204\uB974\uC138\uC694."),
                             React.createElement("input", { value: memberSearch, onChange: (e) => setMemberSearch(e.target.value), placeholder: "\uC774\uB984 \uB610\uB294 \uC0AC\uBC88 \uAC80\uC0C9", className: "w-full mt-3 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" }),
                             memberMsg && React.createElement("p", { className: "text-emerald-600 text-xs font-medium mt-2" }, memberMsg)),
                         React.createElement("div", { className: "divide-y divide-slate-100 border-t border-slate-100" }, Object.values(players)
@@ -2698,18 +3099,21 @@ function BasketballClubApp() {
                         })
                             .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ko'))
                             .map((p) => {
-                            var _a, _b;
+                            var _a, _b, _c;
                             const draft = memberDrafts[p.id] || {};
                             const posValue = (_a = draft.position) !== null && _a !== void 0 ? _a : normalizePosition(p.position);
                             const heightValue = (_b = draft.height) !== null && _b !== void 0 ? _b : (p.height ? String(p.height) : '');
+                            const roleValue = (_c = draft.role) !== null && _c !== void 0 ? _c : roleOf(p);
+                            const assignable = rolesAssignable(me, p);
                             const changed = (draft.position !== undefined && draft.position !== normalizePosition(p.position))
-                                || (draft.height !== undefined && draft.height !== String(p.height || ''));
+                                || (draft.height !== undefined && draft.height !== String(p.height || ''))
+                                || (draft.role !== undefined && draft.role !== roleOf(p));
                             const games = gamesPlayed(p);
                             return (React.createElement("div", { key: p.id, className: "px-4 py-3" },
                                 React.createElement("div", { className: "flex items-center gap-2" },
                                     React.createElement(Avatar, { name: p.name, size: "sm" }),
                                     React.createElement("span", { className: "text-sm font-bold text-slate-800 truncate" }, p.name),
-                                    p.isAdmin && React.createElement("span", { className: "text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0" }, "\uAD00\uB9AC\uC790"),
+                                    rankOf(p) > 0 && React.createElement("span", { className: "text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0" }, ROLE_LABEL[roleOf(p)]),
                                     !validHeight(p.height) && React.createElement("span", { className: "text-xs text-red-500 font-bold bg-red-50 px-1.5 py-0.5 rounded shrink-0" }, "\uD0A4 \uBBF8\uC785\uB825")),
                                 React.createElement("p", { className: "text-xs text-slate-400 mt-1" },
                                     "\uC0AC\uBC88 ",
@@ -2726,9 +3130,12 @@ function BasketballClubApp() {
                                         ")"))),
                                     React.createElement("input", { value: heightValue, onChange: (e) => setMemberDraft(p.id, 'height', e.target.value.replace(/[^0-9]/g, '')), inputMode: "numeric", placeholder: "\uD0A4", className: "w-16 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-1.5 text-right focus:outline-none focus:ring-2 focus:ring-orange-500" }),
                                     React.createElement("span", { className: "text-xs text-slate-500" }, "cm"),
-                                    React.createElement("button", { onClick: () => handleAdminSaveMember(p.id), disabled: busy || !changed, className: "text-xs font-bold text-white bg-orange-600 rounded-lg px-2.5 py-1.5 disabled:opacity-30" }, "\uC800\uC7A5"))));
+                                    React.createElement("button", { onClick: () => handleAdminSaveMember(p.id), disabled: busy || !changed, className: "text-xs font-bold text-white bg-orange-600 rounded-lg px-2.5 py-1.5 disabled:opacity-30" }, "\uC800\uC7A5")),
+                                assignable.length > 0 && p.id !== currentPlayerId && (React.createElement("div", { className: "flex items-center gap-2 mt-2" },
+                                    React.createElement("span", { className: "text-xs text-slate-500 shrink-0" }, "\uAD8C\uD55C"),
+                                    React.createElement("select", { value: roleValue, onChange: (e) => setMemberDraft(p.id, 'role', e.target.value), className: "flex-1 min-w-0 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-1.5 focus:outline-none" }, assignable.map((r) => React.createElement("option", { key: r, value: r }, ROLE_LABEL[r])))))));
                         }))),
-                    React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
+                    can(me, 'backup') && (React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
                         React.createElement("p", { className: "text-slate-800 font-bold text-sm mb-1" }, "\uB370\uC774\uD130 \uBC31\uC5C5 / \uBCF5\uC6D0"),
                         React.createElement("p", { className: "text-slate-400 text-xs mb-3 leading-relaxed" }, "\uC774\uC81C \uB370\uC774\uD130\uB294 \uAD6C\uAE00\uC2DC\uD2B8\uC5D0 \uC788\uC5B4\uC11C \uCF54\uB4DC\uB97C \uC218\uC815\uD574\uB3C4 \uC0AC\uB77C\uC9C0\uC9C0 \uC54A\uC544\uC694. \uC774 \uAE30\uB2A5\uC740 \uB9CC\uC57D\uC744 \uC704\uD55C \uC5EC\uBD84\uC758 \uBC31\uC5C5\uC6A9\uC774\uC5D0\uC694."),
                         React.createElement("button", { onClick: handleExportData, disabled: busy, className: "w-full bg-slate-900 text-white rounded-lg py-2.5 text-sm font-bold flex items-center justify-center gap-2 disabled:opacity-60" }, busy ? React.createElement(Spinner, { size: 16 }) : '백업 만들기'),
@@ -2743,8 +3150,9 @@ function BasketballClubApp() {
                                 React.createElement("p", { className: "text-red-600 text-xs font-bold mb-2" }, "\uD604\uC7AC \uC800\uC7A5\uB41C \uB370\uC774\uD130\uB97C \uB36E\uC5B4\uC501\uB2C8\uB2E4. \uACC4\uC18D\uD560\uAE4C\uC694?"),
                                 React.createElement("div", { className: "grid grid-cols-2 gap-2" },
                                     React.createElement("button", { onClick: () => setConfirmingRestore(false), className: "py-2 rounded-lg text-xs font-bold text-slate-500 bg-white" }, "\uCDE8\uC18C"),
-                                    React.createElement("button", { onClick: handleRestoreData, disabled: busy, className: "py-2 rounded-lg text-xs font-bold text-white bg-red-600" }, "\uB36E\uC5B4\uC4F0\uACE0 \uBCF5\uC6D0")))))),
+                                    React.createElement("button", { onClick: handleRestoreData, disabled: busy, className: "py-2 rounded-lg text-xs font-bold text-white bg-red-600" }, "\uB36E\uC5B4\uC4F0\uACE0 \uBCF5\uC6D0"))))))),
                     React.createElement("p", { className: "text-slate-800 font-bold text-sm" }, "\uD83D\uDCCB \uC5C5\uB370\uC774\uD2B8 \uB85C\uADF8"),
+                    !can(me, 'undoLogs') && React.createElement("p", { className: "text-xs text-slate-400 -mt-1" }, "\uCDE8\uC18C, \uC0AD\uC81C, \uB418\uB3CC\uB9AC\uAE30\uB294 \uAD00\uB9AC\uC790 \uC774\uC0C1\uB9CC \uD560 \uC218 \uC788\uC5B4\uC694."),
                     React.createElement("div", { className: "bg-white rounded-2xl shadow-sm divide-y divide-slate-100" },
                         logs.length === 0 && React.createElement("p", { className: "text-slate-400 text-xs p-4 text-center" }, "\uC544\uC9C1 \uAE30\uB85D\uC774 \uC5C6\uC5B4\uC694."),
                         logs.map((log) => (React.createElement("div", { key: log.id, className: "px-4 py-3 flex items-center justify-between gap-2" },
@@ -2784,8 +3192,15 @@ function BasketballClubApp() {
                                         log.after.games,
                                         "\uD310)")),
                                     log.type === 'prediction' && (React.createElement("span", null,
-                                        "\uACBD\uAE30 \uB9C8\uAC10 \u00B7 ",
-                                        log.void ? '예측 무효 (동률)' : `${log.winners[0]}팀 최다승`)),
+                                        log.auto ? '자동 마감' : '경기 마감',
+                                        " \u00B7 ",
+                                        log.void
+                                            ? (log.winners && log.winners.length ? '예측 무효 (동률)' : '팀끼리 경기 없음')
+                                            : log.winners.length === 1 ? `${log.winners[0]}팀 최다승` : `${log.winners.join('·')}팀 공동 1위`)),
+                                    log.type === 'season-end' && (React.createElement("span", { className: "text-red-600" },
+                                        "\uC2DC\uC98C ",
+                                        log.season,
+                                        " \uC885\uB8CC")),
                                     !log.type && (React.createElement("span", { className: log.winner === 'A' ? 'text-blue-600' : 'text-orange-600' },
                                         log.winner,
                                         "\uD300 \uC2B9\uB9AC \uCC98\uB9AC"))),
@@ -2793,7 +3208,15 @@ function BasketballClubApp() {
                                     log.adminName,
                                     "\uB2D8 \u00B7 ",
                                     formatDateTime(log.timestamp))),
-                            log.undone ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨')) : log.type === 'record-edit' ? (React.createElement("button", { onClick: () => handleRevertEdit(log.id), disabled: busy, className: "text-xs font-bold text-slate-600 shrink-0 border border-slate-200 rounded-full px-2.5 py-1" }, "\uB418\uB3CC\uB9AC\uAE30")) : (React.createElement("button", { onClick: () => handleUndo(log.id), disabled: busy, className: "text-xs font-bold text-red-500 shrink-0 border border-red-200 rounded-full px-2.5 py-1" }, log.type === 'record' ? '삭제' : '취소'))))))))),
+                            log.type === 'season-end' ? null : log.undone ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨')) : !can(me, 'undoLogs') ? null : (log.season || 1) < currentSeason.number ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, "\uC9C0\uB09C \uC2DC\uC98C")) : log.type === 'record-edit' ? (React.createElement("button", { onClick: () => handleRevertEdit(log.id), disabled: busy, className: "text-xs font-bold text-slate-600 shrink-0 border border-slate-200 rounded-full px-2.5 py-1" }, "\uB418\uB3CC\uB9AC\uAE30")) : (React.createElement("button", { onClick: () => handleUndo(log.id), disabled: busy, className: "text-xs font-bold text-red-500 shrink-0 border border-red-200 rounded-full px-2.5 py-1" }, log.type === 'record' ? '삭제' : '취소'))))))))),
+            toast && (React.createElement("div", { className: "fixed left-0 right-0 z-50 flex justify-center px-4 pointer-events-none", style: { bottom: 'calc(5.5rem + env(safe-area-inset-bottom))' } },
+                React.createElement("p", { className: "max-w-sm bg-slate-900 text-white text-xs font-bold rounded-xl px-4 py-3 shadow-lg text-center" }, toast))),
+            inviteFallback && (React.createElement("div", { className: "fixed inset-0 z-50 bg-black/50 flex items-end justify-center px-4", style: { paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }, onClick: () => setInviteFallback('') },
+                React.createElement("div", { className: "w-full max-w-sm bg-white rounded-3xl p-5 shadow-2xl", onClick: (e) => e.stopPropagation() },
+                    React.createElement("p", { className: "text-slate-900 font-bold text-base mb-2" }, "\uCD08\uB300 \uB9C1\uD06C"),
+                    React.createElement("p", { className: "text-xs text-slate-500 mb-2" }, "\uC790\uB3D9 \uBCF5\uC0AC\uAC00 \uC548 \uB418\uB294 \uD658\uACBD\uC774\uC5D0\uC694. \uC544\uB798 \uAE00\uC744 \uAE38\uAC8C \uB20C\uB7EC \uC804\uCCB4 \uC120\uD0DD \uD6C4 \uBCF5\uC0AC\uD574\uC8FC\uC138\uC694."),
+                    React.createElement("textarea", { readOnly: true, value: inviteFallback, onFocus: (e) => e.target.select(), className: "w-full h-28 border border-slate-200 rounded-lg p-2 text-xs text-slate-700 resize-none focus:outline-none" }),
+                    React.createElement("button", { onClick: () => setInviteFallback(''), className: "w-full mt-3 bg-slate-100 text-slate-600 rounded-xl py-3 text-sm font-bold" }, "\uB2EB\uAE30")))),
             rankImage && (React.createElement("div", { className: "fixed inset-0 z-50 bg-black/70 flex flex-col", onClick: closeRankImage },
                 React.createElement("div", { className: "flex-1 overflow-y-auto p-4", style: { paddingTop: 'calc(1rem + env(safe-area-inset-top))' } },
                     React.createElement("img", { src: rankImage.url, alt: "\uB7AD\uD0B9 \uC774\uBBF8\uC9C0", className: "w-full max-w-md mx-auto rounded-xl shadow-2xl", onClick: (e) => e.stopPropagation() })),
@@ -2812,9 +3235,9 @@ function BasketballClubApp() {
                 React.createElement("button", { onClick: () => setTab('mypage'), className: `flex-1 flex flex-col items-center gap-0.5 py-1.5 rounded-xl ${tab === 'mypage' ? 'text-orange-600' : 'text-slate-400'}` },
                     React.createElement("span", { className: "text-lg leading-none" }, "\uD83D\uDC64"),
                     React.createElement("span", { className: "text-xs font-bold" }, "\uB9C8\uC774")),
-                me.isAdmin && (React.createElement("button", { onClick: () => setTab('admin'), className: `flex-1 flex flex-col items-center gap-0.5 py-1.5 rounded-xl ${tab === 'admin' ? 'text-orange-600' : 'text-slate-400'}` },
+                can(me, 'closeDay') && (React.createElement("button", { onClick: () => setTab('admin'), className: `flex-1 flex flex-col items-center gap-0.5 py-1.5 rounded-xl ${tab === 'admin' ? 'text-orange-600' : 'text-slate-400'}` },
                     React.createElement("span", { className: "text-lg leading-none" }, "\uD83D\uDEE1\uFE0F"),
-                    React.createElement("span", { className: "text-xs font-bold" }, "\uAD00\uB9AC\uC790")))))));
+                    React.createElement("span", { className: "text-xs font-bold" }, "\uAD00\uB9AC")))))));
 }
 // ============================================================
 // 앱 설치 팝업 ("설치하시겠습니까?")
@@ -3084,6 +3507,11 @@ const api = {
     const data = await postJson({ action: 'batch', ops, returnKeys });
     return data.values || {};
   },
+  // 조건이 맞을 때만 저장 → { applied, values }
+  async batchIf(ops, returnKeys, requires) {
+    const data = await postJson({ action: 'batch', ops, returnKeys, requires });
+    return { applied: data.applied !== false, values: data.values || {} };
+  },
   async tryLock(key, by, name, ttlMs) {
     return postJson({ action: 'tryLock', key, by, name, ttlMs });
   },
@@ -3120,6 +3548,66 @@ function parseJson(str, fallback) {
 
 const LOG_LIMIT = 300; // 업데이트 로그는 최근 300개까지 보관
 
+// ---------- 권한 ----------
+const ROLES = ['owner', 'admin', 'sub', 'member'];
+const ROLE_LABEL = { owner: '최종관리자', admin: '관리자', sub: '부관리자', member: '일반회원' };
+const ROLE_RANK = { owner: 3, admin: 2, sub: 1, member: 0 };
+// 예전 데이터: 관리자(isAdmin)였던 사람은 최종관리자, 나머지는 일반회원
+function roleOf(p) {
+  if (p && ROLES.includes(p.role)) return p.role;
+  return p?.isAdmin ? 'owner' : 'member';
+}
+function rankOf(p) {
+  return ROLE_RANK[roleOf(p)];
+}
+// 권한별로 할 수 있는 일
+const PERM = {
+  closeDay: 1,       // 경기 마감: 부관리자 이상
+  editMembers: 1,    // 회원 포지션, 키 수정: 부관리자 이상
+  undoLogs: 2,       // 업데이트 로그 취소, 삭제, 되돌리기: 관리자 이상
+  endSeason: 2,      // 시즌 종료: 관리자 이상
+  backup: 3,         // 백업, 복원: 최종관리자
+};
+function can(p, perm) {
+  return rankOf(p) >= PERM[perm];
+}
+// 누가 누구를 어떤 권한으로 바꿀 수 있는지
+// 최종관리자: 모든 권한 지정 가능 / 관리자: 부관리자, 일반회원 사이만 / 그 외: 불가
+function rolesAssignable(actor, target) {
+  const a = roleOf(actor);
+  if (a === 'owner') return ROLES;
+  if (a === 'admin' && ['sub', 'member'].includes(roleOf(target))) return ['sub', 'member'];
+  return [];
+}
+
+// ---------- 소수점 ----------
+function r3(x) {
+  return Math.round((x || 0) * 1000) / 1000;
+}
+function fmtNum(x) {
+  const v = Math.round((x || 0) * 10) / 10;
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
+// ---------- 승부예측 점수 ----------
+// 단독 1위를 맞히면 1점, 공동 1위 중 하나를 골랐으면 1 ÷ (공동 1위 팀 수)점, 그 외 0점
+function predictionCredit(pick, winners) {
+  if (!winners || !winners.length || !winners.includes(pick)) return 0;
+  return r3(1 / winners.length);
+}
+
+// ---------- 숫자 뒤 조사 (시즌 1을 / 시즌 2를) ----------
+function numHasBatchim(n) {
+  return [true, true, false, true, false, false, true, true, true, false][Math.abs(n) % 10];
+}
+function eulReul(n) { return numHasBatchim(n) ? '을' : '를'; }
+function ieyo(n) { return numHasBatchim(n) ? '이에요' : '예요'; }
+
+// ---------- 시즌 ----------
+function currentSeasonOf(seasons) {
+  return seasons?.current || { number: 1, startAt: null, startDate: null };
+}
+
 // ============================================================
 // 유틸 함수
 // ============================================================
@@ -3140,6 +3628,12 @@ function formatDateLabel(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
   const days = ['일', '월', '화', '수', '목', '금', '토'];
   return `${d.getMonth() + 1}월 ${d.getDate()}일 (${days[d.getDay()]})`;
+}
+
+// 시각(ISO) → 그 시각의 날짜 'YYYY-MM-DD' (휴대폰 시간 기준)
+function dateKeyOf(iso) {
+  const d = new Date(iso);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 function shiftDate(dateStr, days) {
@@ -3219,9 +3713,8 @@ function wilsonScore(success, total) {
 function predictionStats(p) {
   if (typeof p?.predTotal === 'number') return { correct: p.predCorrect || 0, total: p.predTotal };
   const history = p?.history || [];
-  const total = history.filter((h) => h.predicted).length;
-  const correct = history.filter((h) => h.predicted && h.predictionCorrect).length;
-  return { correct, total };
+  const preds = history.filter((h) => h.predicted);
+  return { correct: r3(preds.reduce((a, h) => a + (typeof h.credit === 'number' ? h.credit : (h.predictionCorrect ? 1 : 0)), 0)), total: preds.length };
 }
 
 // 가장 최근 경기의 Rating 변화 (예전 데이터는 기록에서 찾음)
@@ -3241,7 +3734,7 @@ function splitLegacyPlayer(p) {
     summary: {
       ...rest,
       predTotal: preds.length,
-      predCorrect: preds.filter((h) => h.predictionCorrect).length,
+      predCorrect: r3(preds.reduce((a, h) => a + (typeof h.credit === 'number' ? h.credit : (h.predictionCorrect ? 1 : 0)), 0)),
       lastEloDelta: lastRec ? lastRec.eloDelta : null,
       lastRecordId: lastRec ? (lastRec.recordId || null) : null,
     },
@@ -3264,7 +3757,7 @@ function winRatePct(p) {
 const ELO_BASE = 1500;     // 처음 시작 점수
 const ELO_K_NEW = 40;      // 경기 수가 적은 사람은 점수가 빨리 자리 잡도록 크게 움직임
 const ELO_K = 24;          // 경기를 어느 정도 한 사람
-const ELO_NEW_GAMES = 10;  // 이 경기 수 미만이면 '새로 온 사람'으로 봄
+const ELO_NEW_GAMES = 20;  // 이 경기 수 미만이면 '새로 온 사람'으로 봄 (점수가 크게 움직이는 기간)
 
 function eloOf(p) {
   return typeof p?.elo === 'number' ? p.elo : ELO_BASE;
@@ -3565,7 +4058,7 @@ function applyRecord(nextPlayers, record, basis = null) {
         lastRecordId: recordId,
       };
       applied[id] = { wins: myWins, losses: myLosses, eloDelta, k };
-      historyEntries[id] = { id: recordId, kind: 'record', recordId, date, team: myLabel, opponent: oppLabel, wins: myWins, losses: myLosses, eloDelta, k, manual: !fromTeams };
+      historyEntries[id] = { id: recordId, kind: 'record', recordId, date, season: record.season || 1, team: myLabel, opponent: oppLabel, wins: myWins, losses: myLosses, eloDelta, k, manual: !fromTeams };
       deltas.push({ playerId: id, winsDelta: myWins, lossesDelta: myLosses, predictionScoreDelta: 0, eloDelta });
     });
   };
@@ -3915,11 +4408,11 @@ function BasketballClubApp() {
   const [recWinsA, setRecWinsA] = useState(null);     // 팀1(왼쪽)의 승수
   const [confirmingRecord, setConfirmingRecord] = useState(false);
   const [confirmingClose, setConfirmingClose] = useState(false);
-  const [showAdminClaim, setShowAdminClaim] = useState(false);
-  const [adminCodeInput, setAdminCodeInput] = useState('');
   const [rankMode, setRankMode] = useState('winrate');
   const [rankImage, setRankImage] = useState(null);   // { url, blob, fileName }
   const [rankImageBusy, setRankImageBusy] = useState(false);
+  const [toast, setToast] = useState('');        // 잠깐 떴다 사라지는 안내
+  const [inviteFallback, setInviteFallback] = useState(''); // 자동 복사가 안 될 때 직접 복사할 초대 문구
 
   const [showChangePassword, setShowChangePassword] = useState(false);
   const [curPassword, setCurPassword] = useState('');
@@ -3928,7 +4421,13 @@ function BasketballClubApp() {
   const [pwChangeMsg, setPwChangeMsg] = useState('');
   const [historyShowCount, setHistoryShowCount] = useState(10);
   const [myHistory, setMyHistory] = useState(null); // 마이페이지에서 불러오는 내 경기 기록
+  const [seasons, setSeasons] = useState(null);       // { current: { number, startAt, startDate }, past: [...] }
+  const [seasonView, setSeasonView] = useState(null); // 랭킹에서 보는 지난 시즌 번호 (null이면 이번 시즌)
+  const [seasonSnapshots, setSeasonSnapshots] = useState({});
+  const [confirmingSeasonEnd, setConfirmingSeasonEnd] = useState(false);
+  const [seasonMsg, setSeasonMsg] = useState('');
   const pendingRef = useRef(0); // 저장 중에는 주기적 새로고침이 화면을 덮어쓰지 않도록
+  const autoCloseRef = useRef(async () => {}); // 자동 마감 함수 (아래에서 연결)
 
   const [backupText, setBackupText] = useState('');
   const [backupMsg, setBackupMsg] = useState('');
@@ -3944,13 +4443,14 @@ function BasketballClubApp() {
     const lk = `editLock:${viewDate}`;
     if (Object.prototype.hasOwnProperty.call(values, lk)) setEditLock(parseJson(values[lk], null));
     if (Object.prototype.hasOwnProperty.call(values, 'updateLog')) setLogs(parseJson(values.updateLog, []));
+    if (Object.prototype.hasOwnProperty.call(values, 'seasons')) setSeasons(parseJson(values.seasons, null));
     const hk = `history:${currentPlayerId}`;
     if (currentPlayerId && Object.prototype.hasOwnProperty.call(values, hk)) setMyHistory(parseJson(values[hk], []));
   };
 
   // 지금 보고 있는 탭에 필요한 데이터만
   const pollKeys = () => {
-    const keys = ['players', `daily:${viewDate}`, `editLock:${viewDate}`];
+    const keys = ['players', `daily:${viewDate}`, `editLock:${viewDate}`, 'seasons'];
     if (tab === 'admin') keys.push('updateLog');
     if (tab === 'mypage' && currentPlayerId) keys.push(`history:${currentPlayerId}`);
     return keys;
@@ -3976,9 +4476,12 @@ function BasketballClubApp() {
   // 예전 형식(선수 정보 안에 경기 기록이 통째로)이면 한 번만 나눠서 저장
   const ensureMigrated = async (map) => {
     const legacyIds = Object.keys(map).filter((id) => Array.isArray(map[id].history));
-    if (!legacyIds.length) return map;
+    const noRoleIds = Object.keys(map).filter((id) => !ROLES.includes(map[id].role));
+    if (!legacyIds.length && !noRoleIds.length) return map;
     const ops = [];
     const patches = [];
+    // 권한 단계 도입: 예전 관리자는 최종관리자, 나머지는 일반회원
+    noRoleIds.forEach((id) => patches.push({ op: 'set', path: [id, 'role'], value: roleOf(map[id]) }));
     legacyIds.forEach((id) => {
       const { summary, history } = splitLegacyPlayer(map[id]);
       ops.push({ key: `history:${id}`, type: 'setIfAbsent', value: JSON.stringify(history) });
@@ -4000,14 +4503,17 @@ function BasketballClubApp() {
     (async () => {
       setLoading(true);
       try {
-        const values = await api.getMany(['players', `daily:${dateKey}`, `editLock:${dateKey}`]);
+        const values = await api.getMany(['players', `daily:${dateKey}`, `editLock:${dateKey}`, 'seasons']);
         let p = parsePlayers(values.players);
         p = await ensureMigrated(p).catch(() => p);
         setPlayers(p);
+        setSeasons(parseJson(values.seasons, null));
         setDaily(parseJson(values[`daily:${dateKey}`], emptyDaily()));
         setEditLock(parseJson(values[`editLock:${dateKey}`], null));
         const savedId = localStorage.getItem('currentPlayerId');
         if (savedId && p[savedId]) setCurrentPlayerId(savedId);
+        // 관리자가 마감하지 않은 지난 날은 자동으로 마감 (화면은 먼저 보여주고 뒤에서 처리)
+        setTimeout(() => { autoCloseRef.current().catch(() => {}); }, 0);
       } catch (e) {
         console.error(e);
         setError(`데이터를 불러오지 못했어요. (${serverErrorText(e)})`);
@@ -4088,7 +4594,7 @@ function BasketballClubApp() {
         id: empId, name, employeeId: empId, passwordHash: hash, passwordMethod: method,
         position: regPosition, height, elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0,
         predTotal: 0, predCorrect: 0, lastEloDelta: null, lastRecordId: null,
-        isAdmin: Object.keys(fresh).length === 0,
+        role: Object.keys(fresh).length === 0 ? 'owner' : 'member',
         createdAt: new Date().toISOString(),
       };
       // 같은 사번으로 거의 동시에 가입하면 먼저 저장된 사람만 남음
@@ -4127,6 +4633,40 @@ function BasketballClubApp() {
     }
   };
 
+  // ----- 초대하기: 앱 설치 링크를 복사 -----
+  const inviteLink = () => `${window.location.origin}${window.location.pathname}`;
+  const inviteText = () => `[${CLUB_NAME}] 농구 동호회 앱에 초대해요!\n아래 링크를 열고 '설치'를 누르면 앱처럼 쓸 수 있어요.\n${inviteLink()}`;
+
+  const showToast = (msg) => {
+    setToast(msg);
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => setToast(''), 2500);
+  };
+
+  const handleInvite = async () => {
+    const text = inviteText();
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('초대 링크를 복사했어요. 카톡이나 메신저에 붙여넣어 보내세요.');
+      return;
+    } catch (e) {
+      // 일부 브라우저는 자동 복사를 막아서, 예전 방식으로 한 번 더 시도
+    }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      if (ok) { showToast('초대 링크를 복사했어요. 카톡이나 메신저에 붙여넣어 보내세요.'); return; }
+    } catch (e) { /* 아래에서 직접 복사하도록 안내 */ }
+    setInviteFallback(text);
+  };
+
   const handleLogout = () => {
     localStorage.removeItem('currentPlayerId');
     setCurrentPlayerId(null);
@@ -4162,6 +4702,11 @@ function BasketballClubApp() {
   const cachedForCurrent = !!daily.teamCache?.[attendanceKey(attendeePlayers.map((p) => p.id))];
   const more = moreNeeded(attendeePlayers.length);
   const myName = me?.name || currentPlayerId;
+  const currentSeason = currentSeasonOf(seasons);
+  // 지난 시즌 기록은 바꿀 수 없음 (시즌 번호가 없는 예전 기록은 시즌 1)
+  const isPastSeasonRecord = (r) => (r?.season || 1) < currentSeason.number;
+  // 이번 시즌 시작 전 날짜에는 새 기록을 넣을 수 없음
+  const viewBeforeSeason = !!currentSeason.startDate && viewDate < currentSeason.startDate;
   const lockedByOther = lockActive(editLock) && editLock.by !== currentPlayerId;
   const standings = Object.fromEntries(teamLabels.map((l) => [l, 0]));
   teamRecords.forEach((r) => {
@@ -4386,6 +4931,8 @@ function BasketballClubApp() {
   const openRecordForm = async (record = null) => {
     setError('');
     setLockNotice('');
+    if (record && isPastSeasonRecord(record)) { setError('지난 시즌 기록은 바꿀 수 없어요.'); return; }
+    if (!record && viewBeforeSeason) { setError('이번 시즌 시작 전 날짜에는 기록을 넣을 수 없어요.'); return; }
     if (record && record.fromTeams && daily.predictionResult?.finalized) {
       setError('마감된 날의 오늘 팀끼리 기록은 관리자가 마감을 취소한 뒤에 수정할 수 있어요.');
       return;
@@ -4461,6 +5008,8 @@ function BasketballClubApp() {
     const freshDaily = parseJson(fresh[dk], emptyDaily());
     const existing = editingId ? (freshDaily.records || []).find((r) => r.id === editingId) : null;
     if (editingId && !existing) throw new Error('이 기록은 이미 삭제됐어요');
+    if (existing && isPastSeasonRecord(existing)) throw new Error('지난 시즌 기록은 바꿀 수 없어요');
+    if (!existing && viewBeforeSeason) throw new Error('이번 시즌 시작 전 날짜에는 기록을 넣을 수 없어요');
     if (freshDaily.predictionResult?.finalized && (fromTeams || existing?.fromTeams)) {
       throw new Error('마감된 날에는 오늘 팀끼리 기록을 추가하거나 수정할 수 없어요. 직접 구성으로 입력해주세요');
     }
@@ -4480,6 +5029,7 @@ function BasketballClubApp() {
     const record = {
       ...(existing || {}),
       id: recordId, date, sideA, sideB, games, winsA, winsB: games - winsA, fromTeams,
+      season: existing?.season || currentSeason.number,
       createdAt: existing?.createdAt || nowIso,
       enteredBy: existing?.enteredBy || myName,
       ...(existing ? { editedBy: myName, editedAt: nowIso } : {}),
@@ -4494,8 +5044,8 @@ function BasketballClubApp() {
     ])].filter((id) => nextPlayers[id]);
     const snapshot = (r) => ({ sideA: r.sideA, sideB: r.sideB, games: r.games, winsA: r.winsA, winsB: r.winsB, fromTeams: r.fromTeams });
     const logEntry = existing
-      ? { id: uniqueId(`edit-${date}`), type: 'record-edit', recordId, date, timestamp: nowIso, adminName: myName, before: snapshot(existing), after: snapshot(record), undone: false }
-      : { id: recordId, type: 'record', recordId, date, timestamp: nowIso, adminName: myName, labelA: sideA.label, labelB: sideB.label, games, winsA, winsB: games - winsA, fromTeams, playerDeltas: deltas, undone: false };
+      ? { id: uniqueId(`edit-${date}`), type: 'record-edit', recordId, date, season: record.season, timestamp: nowIso, adminName: myName, before: snapshot(existing), after: snapshot(record), undone: false }
+      : { id: recordId, type: 'record', recordId, date, season: record.season, timestamp: nowIso, adminName: myName, labelA: sideA.label, labelB: sideB.label, games, winsA, winsB: games - winsA, fromTeams, playerDeltas: deltas, undone: false };
 
     const ops = [
       { key: 'players', type: 'json', patches: playerFieldPatches(nextPlayers, touched, RECORD_FIELDS) },
@@ -4541,6 +5091,7 @@ function BasketballClubApp() {
     setError('');
     const entry = logs.find((l) => l.id === logId);
     if (!entry || entry.undone) return;
+    if ((entry.season || 1) < currentSeason.number) { setError('지난 시즌 기록은 바꿀 수 없어요.'); return; }
     setBusy(true);
     try {
       const ok = await acquireLock();
@@ -4561,63 +5112,85 @@ function BasketballClubApp() {
   };
 
   // ----- 그날 경기 마감 + 승부예측 결과 확정 (읽기 1번 + 저장 1번) -----
+  // 단독 1위를 맞히면 1점, 공동 1위면 그 팀들 중 하나를 고른 사람에게 1 ÷ (공동 1위 팀 수)점
+  // 오늘 팀끼리 경기가 하나도 없으면 예측 없이 마감(무효)
+  // 같은 날을 두 번 마감하지 않도록 서버에서 "아직 마감 안 됐을 때만" 저장
+  const closeDay = async (date, { auto = false } = {}) => {
+    const dk = `daily:${date}`;
+    const fresh = await api.getMany(['players', dk, 'seasons']);
+    const freshDaily = parseJson(fresh[dk], emptyDaily());
+    if (freshDaily.predictionResult?.finalized || freshDaily.result?.finalized) return { applied: false, reason: 'already' };
+    const season = currentSeasonOf(parseJson(fresh.seasons, null));
+    if (season.startDate && date < season.startDate) return { applied: false, reason: 'past-season' };
+    const freshPlayers = await ensureMigrated(parsePlayers(fresh.players));
+    const labels = TEAM_LABELS.filter((l) => freshDaily.teams?.[l]?.length);
+    const recs = (freshDaily.records || []).filter((r) => r.fromTeams);
+    if (!auto && !recs.length) return { applied: false, reason: 'no-games' };
+
+    const st = Object.fromEntries(labels.map((l) => [l, 0]));
+    recs.forEach((r) => {
+      if (r.sideA.label in st) st[r.sideA.label] += r.winsA;
+      if (r.sideB.label in st) st[r.sideB.label] += r.winsB;
+    });
+    const noGames = !recs.length;
+    const max = labels.length ? Math.max(...labels.map((l) => st[l])) : 0;
+    const winners = noGames ? [] : labels.filter((l) => st[l] === max);
+    const predictionId = uniqueId(`pred-${date}`);
+    const nowIso = new Date().toISOString();
+    const by = auto ? '자동 마감' : myName;
+    const deltas = [];
+    const nextPlayers = { ...freshPlayers };
+    const predictors = [];
+    const ops = [];
+
+    if (!noGames) {
+      Object.entries(freshDaily.predictions || {}).forEach(([pid, pick]) => {
+        const pl = nextPlayers[pid];
+        if (!pl) return;
+        const credit = predictionCredit(pick, winners);
+        const stats = predictionStats(pl);
+        nextPlayers[pid] = {
+          ...pl,
+          predictionScore: r3((pl.predictionScore || 0) + credit),
+          predTotal: stats.total + 1,
+          predCorrect: r3(stats.correct + credit),
+        };
+        predictors.push(pid);
+        deltas.push({ playerId: pid, winsDelta: 0, lossesDelta: 0, predictionScoreDelta: credit, predTotalDelta: 1, predCorrectDelta: credit, eloDelta: 0 });
+        ops.push({
+          key: `history:${pid}`, type: 'json', init: [],
+          patches: [{ op: 'upsertById', value: { id: predictionId, kind: 'prediction', predictionId, date, season: season.number, predicted: pick, predictionCorrect: credit > 0, credit } }],
+        });
+      });
+      ops.push({ key: 'players', type: 'json', patches: playerFieldPatches(nextPlayers, predictors, ['predictionScore', 'predTotal', 'predCorrect']) });
+    }
+    const result = {
+      finalized: true, winners, void: noGames, reason: noGames ? 'no-games' : null,
+      credit: winners.length ? r3(1 / winners.length) : 0, standings: st, predictionId, timestamp: nowIso, auto, by,
+    };
+    ops.push({ key: dk, type: 'json', patches: [{ op: 'set', path: ['predictionResult'], value: result }] });
+    ops.push({
+      key: 'updateLog', type: 'json', init: [],
+      patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: predictionId, type: 'prediction', predictionId, date, season: season.number, timestamp: nowIso, adminName: by, winners, void: noGames, auto, playerDeltas: deltas, undone: false } }],
+    });
+    const returnKeys = ['players', `daily:${viewDate}`];
+    pendingRef.current += 1;
+    try {
+      const res = await api.batchIf(ops, returnKeys, [{ key: dk, path: ['predictionResult', 'finalized'], absent: true }]);
+      applyValues(res.values);
+      return { applied: res.applied };
+    } finally {
+      pendingRef.current -= 1;
+    }
+  };
+
   const handleClosePredictions = async () => {
     setError('');
     setBusy(true);
     try {
-      const date = viewDate;
-      const dk = `daily:${date}`;
-      const fresh = await api.getMany(['players', dk]);
-      const freshDaily = parseJson(fresh[dk], emptyDaily());
-      if (freshDaily.predictionResult?.finalized) return;
-      const freshPlayers = await ensureMigrated(parsePlayers(fresh.players));
-      const labels = TEAM_LABELS.filter((l) => freshDaily.teams?.[l]?.length);
-      const recs = (freshDaily.records || []).filter((r) => r.fromTeams);
-      if (!recs.length) { setError('오늘 팀끼리 기록된 경기가 없어요.'); return; }
-      const st = Object.fromEntries(labels.map((l) => [l, 0]));
-      recs.forEach((r) => {
-        if (r.sideA.label in st) st[r.sideA.label] += r.winsA;
-        if (r.sideB.label in st) st[r.sideB.label] += r.winsB;
-      });
-      const max = Math.max(...labels.map((l) => st[l]));
-      const winners = labels.filter((l) => st[l] === max);
-      const isVoid = winners.length !== 1; // 1위가 동률이면 예측은 무효
-      const predictionId = uniqueId(`pred-${date}`);
-      const deltas = [];
-      const nextPlayers = { ...freshPlayers };
-      const predictors = [];
-      const ops = [];
-
-      if (!isVoid) {
-        Object.entries(freshDaily.predictions || {}).forEach(([pid, pick]) => {
-          const pl = nextPlayers[pid];
-          if (!pl) return;
-          const correct = pick === winners[0];
-          const stats = predictionStats(pl);
-          nextPlayers[pid] = {
-            ...pl,
-            predictionScore: (pl.predictionScore || 0) + (correct ? 1 : 0),
-            predTotal: stats.total + 1,
-            predCorrect: stats.correct + (correct ? 1 : 0),
-          };
-          predictors.push(pid);
-          deltas.push({ playerId: pid, winsDelta: 0, lossesDelta: 0, predictionScoreDelta: correct ? 1 : 0, predTotalDelta: 1, predCorrectDelta: correct ? 1 : 0, eloDelta: 0 });
-          ops.push({
-            key: `history:${pid}`, type: 'json', init: [],
-            patches: [{ op: 'upsertById', value: { id: predictionId, kind: 'prediction', predictionId, date, predicted: pick, predictionCorrect: correct } }],
-          });
-        });
-        ops.push({ key: 'players', type: 'json', patches: playerFieldPatches(nextPlayers, predictors, ['predictionScore', 'predTotal', 'predCorrect']) });
-      }
-      ops.push({
-        key: dk, type: 'json',
-        patches: [{ op: 'set', path: ['predictionResult'], value: { finalized: true, winners, void: isVoid, standings: st, predictionId, timestamp: new Date().toISOString() } }],
-      });
-      ops.push({
-        key: 'updateLog', type: 'json', init: [],
-        patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: predictionId, type: 'prediction', predictionId, date, timestamp: new Date().toISOString(), adminName: myName, winners, void: isVoid, playerDeltas: deltas, undone: false } }],
-      });
-      await write(ops, ['players', dk]);
+      const r = await closeDay(viewDate);
+      if (r.reason === 'no-games') setError('오늘 팀끼리 기록된 경기가 없어요.');
+      else if (r.reason === 'past-season') setError('지난 시즌 날짜는 마감할 수 없어요.');
       setConfirmingClose(false);
     } catch (e) {
       setError(`마감 처리 중 문제가 발생했습니다. (${serverErrorText(e)})`);
@@ -4626,11 +5199,40 @@ function BasketballClubApp() {
     }
   };
 
+  // ----- 자동 마감: 마감하지 않은 지난 날(최근 2주, 이번 시즌)을 찾아서 마감 -----
+  // 오늘 팀끼리 경기 기록이 있는 지난 날만 마감해요. 단, 오늘 그날 기록을 입력하거나 고친 사람이 있으면
+  // (지난 경기 사후입력 중) 하루 더 기다렸다가 마감해요. force면 기다리지 않고 마감 (시즌 종료 때)
+  const autoCloseOpenDays = async ({ force = false } = {}) => {
+    if (!API_URL || API_URL.indexOf('PASTE_YOUR') === 0) return 0;
+    const dates = [];
+    for (let i = 1; i <= 14; i++) dates.push(shiftDate(dateKey, -i));
+    const values = await api.getMany(['seasons', ...dates.map((d) => `daily:${d}`)]);
+    const season = currentSeasonOf(parseJson(values.seasons, null));
+    const open = dates.filter((d) => {
+      if (season.startDate && d < season.startDate) return false;
+      const day = parseJson(values[`daily:${d}`], null);
+      if (!day || !day.teams || day.predictionResult?.finalized || day.result?.finalized) return false;
+      const recs = day.records || [];
+      if (!recs.some((r) => r.fromTeams)) return false; // 팀끼리 경기가 없으면 정산할 것이 없음 (사후입력 가능하게 열어둠)
+      if (force) return true;
+      const touchedToday = recs.some((r) => dateKeyOf(r.editedAt || r.createdAt || 0) >= dateKey);
+      return !touchedToday;
+    });
+    let closed = 0;
+    for (const d of open.sort()) {
+      const r = await closeDay(d, { auto: true });
+      if (r.applied) closed += 1;
+    }
+    return closed;
+  };
+  autoCloseRef.current = autoCloseOpenDays;
+
   // ----- 업데이트 로그에서 취소/삭제 (읽기 1번 + 저장 1번) -----
   const handleUndo = async (logId) => {
     setError('');
     const entry = logs.find((l) => l.id === logId);
     if (!entry || entry.undone) return;
+    if ((entry.season || 1) < currentSeason.number) { setError('지난 시즌 기록은 바꿀 수 없어요.'); return; }
     const type = entry.type || 'legacy';
     setBusy(true);
     try {
@@ -4669,10 +5271,10 @@ function BasketballClubApp() {
             ...pl,
             wins: (pl.wins || 0) - (d.winsDelta || 0),
             losses: (pl.losses || 0) - (d.lossesDelta || 0),
-            predictionScore: (pl.predictionScore || 0) - (d.predictionScoreDelta || 0),
+            predictionScore: r3((pl.predictionScore || 0) - (d.predictionScoreDelta || 0)),
             elo: eloOf(pl) - (d.eloDelta || 0),
             predTotal: stats.total - (isPred ? (d.predTotalDelta ?? 1) : 0),
-            predCorrect: stats.correct - (isPred ? (d.predCorrectDelta ?? d.predictionScoreDelta ?? 0) : 0),
+            predCorrect: r3(stats.correct - (isPred ? (d.predCorrectDelta ?? d.predictionScoreDelta ?? 0) : 0)),
           };
           ids.push(d.playerId);
           ops.push({
@@ -4699,21 +5301,6 @@ function BasketballClubApp() {
     [{ key: 'players', type: 'json', patches: Object.entries(fields).map(([f, v]) => ({ op: 'set', path: [id, f], value: v })) }],
     ['players'],
   );
-
-  const handleClaimAdmin = async () => {
-    setError('');
-    if (adminCodeInput !== ADMIN_CODE) { setError('관리자 코드가 올바르지 않습니다.'); return; }
-    setBusy(true);
-    try {
-      await patchPlayer(currentPlayerId, { isAdmin: true });
-      setShowAdminClaim(false);
-      setAdminCodeInput('');
-    } catch (e) {
-      setError(`관리자 등록 중 문제가 발생했습니다. (${serverErrorText(e)})`);
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const handlePositionChange = async (newPos) => {
     const before = players;
@@ -4751,16 +5338,30 @@ function BasketballClubApp() {
     setMemberMsg('');
     const draft = memberDrafts[id] || {};
     const update = {};
-    if (draft.position !== undefined) update.position = normalizePosition(draft.position);
+    if (draft.position !== undefined) {
+      if (!can(me, 'editMembers')) { setError('회원 정보를 바꿀 권한이 없어요.'); return; }
+      update.position = normalizePosition(draft.position);
+    }
     if (draft.height !== undefined) {
+      if (!can(me, 'editMembers')) { setError('회원 정보를 바꿀 권한이 없어요.'); return; }
       const h = validHeight(draft.height);
       if (h === null) { setError(`키는 ${MIN_HEIGHT}~${MAX_HEIGHT} 사이 숫자(cm)로 입력해주세요.`); return; }
       update.height = h;
+    }
+    if (draft.role !== undefined && draft.role !== roleOf(players[id])) {
+      if (!rolesAssignable(me, players[id]).includes(draft.role)) { setError('이 권한으로 바꿀 수 없어요.'); return; }
+      update.role = draft.role;
     }
     if (!Object.keys(update).length) return;
     setBusy(true);
     try {
       if (!players[id]) { setError('회원 정보를 찾을 수 없습니다.'); return; }
+      if (update.role && roleOf(players[id]) === 'owner' && update.role !== 'owner') {
+        // 최종관리자는 항상 한 명 이상 남아 있어야 함 (최신 정보로 확인)
+        const fresh = parsePlayers((await api.getMany(['players'])).players);
+        const owners = Object.values(fresh).filter((p) => roleOf(p) === 'owner');
+        if (owners.length <= 1) { setError('최종관리자는 최소 한 명 있어야 해요. 다른 사람을 먼저 최종관리자로 지정해주세요.'); return; }
+      }
       await patchPlayer(id, update);
       setMemberDrafts((d) => { const n = { ...d }; delete n[id]; return n; });
       setMemberMsg(`${players[id].name}님 정보를 저장했어요.`);
@@ -4769,6 +5370,98 @@ function BasketballClubApp() {
     } finally {
       setBusy(false);
     }
+  };
+
+  // ----- 시즌 종료 -----
+  // 1) 마감 안 된 지난 날을 먼저 자동 마감  2) 오늘 경기가 열려 있으면 중단
+  // 3) 이번 시즌 기록(승패, Rating, 예측)을 시즌 보관함에 저장  4) 모두 처음 상태로 초기화하고 다음 시즌 시작
+  // 같은 시즌을 두 번 종료하지 않도록 서버에서 "아직 이 시즌일 때만" 저장
+  const handleEndSeason = async () => {
+    setError('');
+    setSeasonMsg('');
+    if (!can(me, 'endSeason')) { setError('시즌을 종료할 권한이 없어요.'); return; }
+    setBusy(true);
+    try {
+      await autoCloseOpenDays({ force: true });
+      const fresh = await api.getMany(['players', 'seasons', `daily:${dateKey}`]);
+      const today = parseJson(fresh[`daily:${dateKey}`], emptyDaily());
+      if (today.teams && (today.records || []).some((r) => r.fromTeams) && !today.predictionResult?.finalized) {
+        setError('오늘 경기가 아직 마감되지 않았어요. 오늘 경기를 먼저 마감한 뒤 시즌을 종료해주세요.');
+        return;
+      }
+      const seasonsData = parseJson(fresh.seasons, null);
+      const cur = currentSeasonOf(seasonsData);
+      if (cur.number !== currentSeason.number) {
+        // 화면을 보는 사이 다른 사람이 이미 시즌을 종료함 → 다음 시즌을 실수로 종료하지 않도록 중단
+        setSeasons(seasonsData);
+        setConfirmingSeasonEnd(false);
+        setSeasonMsg(`이미 다른 사람이 시즌 ${currentSeason.number}${eulReul(currentSeason.number)} 종료했어요. 지금은 시즌 ${cur.number}${ieyo(cur.number)}.`);
+        return;
+      }
+      const freshPlayers = await ensureMigrated(parsePlayers(fresh.players));
+      const nowIso = new Date().toISOString();
+      const snapshotPlayers = {};
+      Object.values(freshPlayers).forEach((p) => {
+        const st = predictionStats(p);
+        snapshotPlayers[p.id] = {
+          id: p.id, name: p.name, position: p.position,
+          wins: p.wins || 0, losses: p.losses || 0, elo: eloOf(p),
+          predTotal: st.total, predCorrect: st.correct, predictionScore: p.predictionScore || 0,
+          lastEloDelta: lastEloDeltaOf(p),
+        };
+      });
+      const snapshot = { number: cur.number, startAt: cur.startAt, startDate: cur.startDate, endAt: nowIso, endDate: dateKey, endedBy: myName, players: snapshotPlayers };
+      const next = { number: cur.number + 1, startAt: nowIso, startDate: dateKey };
+      const reset = { wins: 0, losses: 0, elo: ELO_BASE, predictionScore: 0, predTotal: 0, predCorrect: 0, lastEloDelta: null, lastRecordId: null };
+      const ids = Object.keys(freshPlayers);
+      const ops = [
+        { key: `season:${cur.number}`, type: 'set', value: JSON.stringify(snapshot) },
+        { key: 'players', type: 'json', patches: ids.flatMap((id) => Object.entries(reset).map(([f, v]) => ({ op: 'set', path: [id, f], value: v }))) },
+        {
+          key: 'seasons', type: 'json',
+          patches: [
+            { op: 'set', path: ['current'], value: next },
+            { op: 'upsertById', path: ['past'], value: { id: `season-${cur.number}`, number: cur.number, startAt: cur.startAt, startDate: cur.startDate, endAt: nowIso, endDate: dateKey, endedBy: myName } },
+          ],
+        },
+        {
+          key: 'updateLog', type: 'json', init: [],
+          patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: uniqueId('season-end'), type: 'season-end', date: dateKey, season: cur.number, timestamp: nowIso, adminName: myName, undone: true } }],
+        },
+      ];
+      const requires = cur.number === 1 && !seasonsData?.current
+        ? [{ key: 'seasons', path: ['current'], absent: true }]
+        : [{ key: 'seasons', path: ['current', 'number'], equals: cur.number }];
+      pendingRef.current += 1;
+      try {
+        const res = await api.batchIf(ops, ['players', 'seasons', 'updateLog'], requires);
+        applyValues(res.values);
+        setSeasonMsg(res.applied ? `시즌 ${cur.number}${eulReul(cur.number)} 마치고 시즌 ${cur.number + 1}${eulReul(cur.number + 1)} 시작했어요.` : '이미 다른 사람이 시즌을 종료했어요.');
+      } finally {
+        pendingRef.current -= 1;
+      }
+      setConfirmingSeasonEnd(false);
+      setSeasonView(null);
+    } catch (e) {
+      setError(`시즌 종료 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 지난 시즌 랭킹 보기: 보관된 기록 불러오기
+  const openSeasonView = async (n) => {
+    if (n === null) { setSeasonView(null); return; }
+    if (!seasonSnapshots[n]) {
+      try {
+        const v = await api.getMany([`season:${n}`]);
+        setSeasonSnapshots((m) => ({ ...m, [n]: parseJson(v[`season:${n}`], null) }));
+      } catch (e) {
+        setError(`지난 시즌 기록을 불러오지 못했어요. (${serverErrorText(e)})`);
+        return;
+      }
+    }
+    setSeasonView(n);
   };
 
   const handleChangePassword = async () => {
@@ -4803,7 +5496,8 @@ function BasketballClubApp() {
     try {
       const dailyKeys = await api.list('daily:');
       const historyKeys = await api.list('history:');
-      const values = await api.getMany(['players', 'updateLog', ...dailyKeys, ...historyKeys]);
+      const seasonKeys = await api.list('season:');
+      const values = await api.getMany(['players', 'updateLog', 'seasons', ...dailyKeys, ...historyKeys, ...seasonKeys]);
       const dailyData = {};
       dailyKeys.forEach((k) => { const v = parseJson(values[k], null); if (v) dailyData[k.slice('daily:'.length)] = v; });
       const histories = {};
@@ -4816,6 +5510,8 @@ function BasketballClubApp() {
         updateLog: parseJson(values.updateLog, []),
         daily: dailyData,
         history: histories,
+        seasons: parseJson(values.seasons, null),
+        seasonArchive: Object.fromEntries(seasonKeys.map((k) => [k.slice('season:'.length), parseJson(values[k], null)])),
       };
 
       setBackupText(JSON.stringify(backup));
@@ -4859,6 +5555,8 @@ function BasketballClubApp() {
         { key: 'updateLog', type: 'set', value: JSON.stringify(parsed.updateLog || []) },
         ...dailyEntries.map(([date, data]) => ({ key: `daily:${date}`, type: 'set', value: JSON.stringify(data) })),
         ...Object.entries(parsed.history || {}).map(([id, h]) => ({ key: `history:${id}`, type: 'set', value: JSON.stringify(h) })),
+        ...(parsed.seasons ? [{ key: 'seasons', type: 'set', value: JSON.stringify(parsed.seasons) }] : []),
+        ...Object.entries(parsed.seasonArchive || {}).map(([n, v]) => ({ key: `season:${n}`, type: 'set', value: JSON.stringify(v) })),
       ];
       const values = await batchWithRetry(ops, ['players', 'updateLog', `daily:${viewDate}`]);
       // 예전 백업(선수 정보 안에 기록이 들어 있는 형식)이면 새 형식으로 나눠 저장
@@ -4885,7 +5583,12 @@ function BasketballClubApp() {
   // - 승률 랭킹: 윌슨 점수, 20경기 이상만 순위 (나머지는 '랭킹 진입 전'에 경기 수 많은 순)
   // - 적중률 랭킹: 윌슨 점수
   // - Rating 랭킹: 엘로 점수, 20경기 이상만 순위
-  const scoredPlayers = Object.values(players).map((p) => {
+  // 이번 시즌이면 지금 회원 기록, 지난 시즌이면 보관된 기록으로 랭킹 계산
+  const pastSeasons = [...(seasons?.past || [])].sort((a, b) => b.number - a.number);
+  const viewingPast = seasonView !== null && !!seasonSnapshots[seasonView];
+  const rankSource = viewingPast ? (seasonSnapshots[seasonView].players || {}) : players;
+  const viewedSeasonNumber = viewingPast ? seasonView : currentSeason.number;
+  const scoredPlayers = Object.values(rankSource).map((p) => {
     const games = gamesPlayed(p);
     const pred = predictionStats(p);
 
@@ -4927,7 +5630,7 @@ function BasketballClubApp() {
       scoreLabel = p.games > 0 ? `${Math.round(p.skill)}` : '-';
     } else if (rankMode === 'prediction') {
       ranked = p.pred.total > 0;
-      detail = ranked ? `${p.pred.total}번 중 ${p.pred.correct}번 적중 · ${pct(p.pred.correct, p.pred.total)}` : '아직 예측 기록 없음';
+      detail = ranked ? `${p.pred.total}번 중 ${fmtNum(p.pred.correct)}점 · ${pct(p.pred.correct, p.pred.total)}` : '아직 예측 기록 없음';
       scoreLabel = ranked ? `${Math.round(p.predScore * 100)}점` : '-';
     } else {
       ranked = p.games >= RANKING_MIN_GAMES;
@@ -4949,7 +5652,10 @@ function BasketballClubApp() {
     setRankImageBusy(true);
     try {
       const d = new Date();
-      const dateText = `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 기준`;
+      const snap = viewingPast ? seasonSnapshots[seasonView] : null;
+      const dateText = snap
+        ? `시즌 ${snap.number} 최종 · ${snap.startDate ? formatDateLabel(snap.startDate) : '처음'} ~ ${formatDateLabel(snap.endDate)}`
+        : `시즌 ${currentSeason.number} · ${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 기준`;
       const rule = rankMode === 'prediction'
         ? '적중률과 예측 횟수를 함께 본 점수 순'
         : rankMode === 'skill'
@@ -4966,7 +5672,7 @@ function BasketballClubApp() {
       if (rankImage) URL.revokeObjectURL(rankImage.url);
       // 파일 이름은 영문으로 (한글 파일 이름은 일부 휴대폰에서 'download'로 바뀌어 저장됨)
       const fileMode = { winrate: 'winrate', prediction: 'prediction', skill: 'rating' }[rankMode];
-      setRankImage({ url: URL.createObjectURL(blob), blob, fileName: `ranking-${fileMode}-${stamp.replace(/\./g, '')}.png` });
+      setRankImage({ url: URL.createObjectURL(blob), blob, fileName: `ranking-s${viewedSeasonNumber}-${fileMode}-${stamp.replace(/\./g, '')}.png` });
     } catch (e) {
       setError(`이미지를 만드는 중 문제가 발생했습니다. (${e?.message || '알 수 없는 오류'})`);
     } finally {
@@ -5004,9 +5710,20 @@ function BasketballClubApp() {
   const myGames = gamesPlayed(me);
   const myPred = predictionStats(me);
   const mySkill = Math.round(eloOf(me));
-  const myWinRankIdx = winRanking.findIndex((p) => p.id === currentPlayerId);
-  const myPredRankIdx = predRanking.findIndex((p) => p.id === currentPlayerId);
-  const mySkillRankIdx = skillRanking.findIndex((p) => p.id === currentPlayerId);
+  // 마이페이지 순위는 랭킹 화면에서 지난 시즌을 보고 있어도 항상 이번 시즌 기준
+  const curScored = viewingPast
+    ? Object.values(players).map((p) => {
+      const games = gamesPlayed(p);
+      const pred = predictionStats(p);
+      return { ...p, games, pred, winScore: wilsonScore(p.wins || 0, games), predScore: wilsonScore(pred.correct, pred.total), skill: eloOf(p) };
+    })
+    : scoredPlayers;
+  const curWin = viewingPast ? [...curScored].sort((a, b) => (qualifies(b) - qualifies(a)) || (hasGames(b) - hasGames(a)) || (b.winScore - a.winScore) || (b.games - a.games)) : winRanking;
+  const curPred = viewingPast ? [...curScored].sort((a, b) => (b.predScore - a.predScore) || (b.pred.total - a.pred.total)) : predRanking;
+  const curSkill = viewingPast ? [...curScored].sort((a, b) => (qualifies(b) - qualifies(a)) || (hasGames(b) - hasGames(a)) || (b.skill - a.skill) || (b.games - a.games)) : skillRanking;
+  const myWinRankIdx = curWin.findIndex((p) => p.id === currentPlayerId);
+  const myPredRankIdx = curPred.findIndex((p) => p.id === currentPlayerId);
+  const mySkillRankIdx = curSkill.findIndex((p) => p.id === currentPlayerId);
   const entryLabel = myGames > 0 ? `랭킹 진입까지 ${RANKING_MIN_GAMES - myGames}경기` : '아직 경기 기록 없음';
   const myWinRankLabel = myGames >= RANKING_MIN_GAMES && myWinRankIdx >= 0 ? `승률 랭킹 ${myWinRankIdx + 1}위` : entryLabel;
   const myPredRankLabel = myPred.total > 0 && myPredRankIdx >= 0 ? `적중률 랭킹 ${myPredRankIdx + 1}위` : '아직 예측 기록 없음';
@@ -5138,6 +5855,7 @@ function BasketballClubApp() {
               <h1 className="font-display text-lg text-white tracking-wide">{CLUB_NAME}</h1>
             </div>
             <div className="flex items-center gap-3">
+              <button onClick={handleInvite} className="text-xs font-bold text-white bg-orange-600 rounded-full px-3 py-1.5" aria-label="초대하기">📨 초대하기</button>
               <button onClick={manualRefresh} className="text-slate-400 text-lg" aria-label="새로고침">🔄</button>
               <button onClick={handleLogout} className="text-slate-400 text-lg" aria-label="로그아웃">🚪</button>
             </div>
@@ -5146,7 +5864,7 @@ function BasketballClubApp() {
             <Avatar name={me.name} size="sm" tone="bg-orange-600" />
             <div className="text-left">
               <p className="text-white text-sm font-bold leading-tight">
-                {me.name}{me.isAdmin && <span className="ml-1 text-xs text-orange-400 font-bold">관리자</span>}
+                {me.name}{rankOf(me) > 0 && <span className="ml-1 text-xs text-orange-400 font-bold">{ROLE_LABEL[roleOf(me)]}</span>}
               </p>
               <p className="text-slate-400 text-xs font-medium">{me.position}</p>
             </div>
@@ -5368,13 +6086,16 @@ function BasketballClubApp() {
                   </div>
                   {daily.predictionResult?.finalized && (
                     <p className="text-center text-xs font-bold mt-3">
-                      {daily.predictionResult.void
-                        ? <span className="text-slate-400">1위가 동률이라 이번 예측은 무효 처리됐어요</span>
-                        : daily.predictions?.[currentPlayerId]
-                          ? (daily.predictions[currentPlayerId] === daily.predictionResult.winners[0]
-                            ? <span className="text-emerald-600">내 예측 적중! 🎉</span>
-                            : <span className="text-slate-400">내 예측은 빗나갔어요</span>)
-                          : <span className="text-slate-400">이번에는 예측하지 않았어요</span>}
+                      {(() => {
+                        const pr = daily.predictionResult;
+                        const pick = daily.predictions?.[currentPlayerId];
+                        if (pr.void) return <span className="text-slate-400">오늘 팀끼리 경기가 없어서 예측 없이 마감됐어요</span>;
+                        if (!pick) return <span className="text-slate-400">이번에는 예측하지 않았어요</span>;
+                        const credit = predictionCredit(pick, pr.winners);
+                        if (credit >= 1) return <span className="text-emerald-600">내 예측 적중! 1점 🎉</span>;
+                        if (credit > 0) return <span className="text-emerald-600">공동 1위를 맞혀서 {fmtNum(credit)}점을 받았어요</span>;
+                        return <span className="text-slate-400">내 예측은 빗나갔어요</span>;
+                      })()}
                     </p>
                   )}
                 </div>
@@ -5382,9 +6103,11 @@ function BasketballClubApp() {
 
               {/* 오늘 우승 팀 */}
               {daily.predictionResult?.finalized && !daily.predictionResult.void && (
-                <div className={`rounded-2xl p-4 text-center ${TEAM_STYLE[daily.predictionResult.winners[0]]?.tone || 'bg-slate-900'}`}>
-                  <p className="text-white text-xs font-bold opacity-80">오늘 경기 마감</p>
-                  <p className="font-display text-2xl text-white mt-0.5">{daily.predictionResult.winners[0]}팀 최다승</p>
+                <div className={`rounded-2xl p-4 text-center ${daily.predictionResult.winners.length === 1 ? (TEAM_STYLE[daily.predictionResult.winners[0]]?.tone || 'bg-slate-900') : 'bg-slate-900'}`}>
+                  <p className="text-white text-xs font-bold opacity-80">{isToday ? '오늘' : '그날'} 경기 마감{daily.predictionResult.auto ? ' (자동)' : ''}</p>
+                  <p className="font-display text-2xl text-white mt-0.5">
+                    {daily.predictionResult.winners.length === 1 ? `${daily.predictionResult.winners[0]}팀 최다승` : `${daily.predictionResult.winners.join('·')}팀 공동 1위`}
+                  </p>
                   <p className="text-white text-xs mt-1 opacity-80">
                     {Object.entries(daily.predictionResult.standings || {}).map(([l, w]) => `${l} ${w}승`).join(' · ')}
                   </p>
@@ -5423,7 +6146,7 @@ function BasketballClubApp() {
                             </p>
                             <div className="flex items-center gap-2 shrink-0">
                               <p className="text-sm font-black text-slate-800">{r.winsA} : {r.winsB}</p>
-                              {!showRecordForm && !(r.fromTeams && daily.predictionResult?.finalized) && (
+                              {!showRecordForm && !(r.fromTeams && daily.predictionResult?.finalized) && !isPastSeasonRecord(r) && (
                                 <button
                                   onClick={() => openRecordForm(r)}
                                   disabled={busy || lockedByOther}
@@ -5455,8 +6178,12 @@ function BasketballClubApp() {
                     </p>
                   )}
 
+                  {viewBeforeSeason && (
+                    <p className="mt-3 text-xs text-slate-400">지난 시즌 날짜라 기록을 넣거나 고칠 수 없어요.</p>
+                  )}
+
                   {/* 결과 입력: 누구나 */}
-                  {!showRecordForm && (
+                  {!showRecordForm && !viewBeforeSeason && (
                     <button
                       onClick={() => openRecordForm()}
                       disabled={busy || lockedByOther}
@@ -5616,7 +6343,7 @@ function BasketballClubApp() {
                   })()}
 
                   {/* 관리자: 그날 경기 마감 (지난 날도 가능) */}
-                  {me.isAdmin && !showRecordForm && teamRecords.length > 0 && !daily.predictionResult?.finalized && (
+                  {can(me, 'closeDay') && !showRecordForm && teamRecords.length > 0 && !daily.predictionResult?.finalized && !viewBeforeSeason && (
                     !confirmingClose ? (
                       <button
                         onClick={() => setConfirmingClose(true)}
@@ -5628,8 +6355,8 @@ function BasketballClubApp() {
                       <div className="bg-slate-50 rounded-xl p-3 mt-2 text-center">
                         <p className="text-sm font-bold text-slate-700 mb-1">
                           {leaders.length === 1
-                            ? `${leaders[0]}팀이 ${topWins}승으로 1위예요.`
-                            : `${leaders.join(', ')}팀이 ${topWins}승으로 동률이라 예측은 무효 처리돼요.`}
+                            ? `${leaders[0]}팀이 ${topWins}승으로 1위예요. 맞힌 사람은 1점`
+                            : `${leaders.join(', ')}팀이 ${topWins}승으로 공동 1위예요. 이 팀들을 고른 사람은 ${fmtNum(1 / leaders.length)}점`}
                         </p>
                         <p className="text-xs text-slate-400 mb-3">마감하면 출석과 예측이 닫히고, 오늘 팀끼리 기록은 더 추가할 수 없어요.</p>
                         <div className="grid grid-cols-2 gap-2">
@@ -5639,6 +6366,9 @@ function BasketballClubApp() {
                       </div>
                     )
                   )}
+                  {teamRecords.length > 0 && !daily.predictionResult?.finalized && (
+                    <p className="text-xs text-slate-400 mt-2 text-center">관리자가 마감하지 않으면 다음 날 자동으로 마감돼요.</p>
+                  )}
                 </div>
               )}
             </div>
@@ -5646,6 +6376,30 @@ function BasketballClubApp() {
 
           {tab === 'ranking' && (
             <div className="space-y-3">
+              {pastSeasons.length > 0 && (
+                <div className="flex gap-2 overflow-x-auto pb-1">
+                  <button
+                    onClick={() => openSeasonView(null)}
+                    className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-bold border ${!viewingPast ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-500 bg-white'}`}
+                  >
+                    시즌 {currentSeason.number} (이번 시즌)
+                  </button>
+                  {pastSeasons.map((ps) => (
+                    <button
+                      key={ps.number}
+                      onClick={() => openSeasonView(ps.number)}
+                      className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-bold border ${viewingPast && seasonView === ps.number ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-500 bg-white'}`}
+                    >
+                      시즌 {ps.number}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {viewingPast && (
+                <p className="text-xs font-bold text-slate-500 px-1">
+                  시즌 {seasonView} 최종 기록 ({seasonSnapshots[seasonView].startDate ? formatDateLabel(seasonSnapshots[seasonView].startDate) : '처음'} ~ {formatDateLabel(seasonSnapshots[seasonView].endDate)})
+                </p>
+              )}
               <div className="flex rounded-lg bg-slate-100 p-1">
                 {[['winrate', '승률 랭킹'], ['prediction', '적중률 랭킹'], ['skill', 'Rating']].map(([mode, label]) => (
                   <button
@@ -5667,7 +6421,7 @@ function BasketballClubApp() {
                 disabled={rankImageBusy || rankingRows.length === 0}
                 className="w-full bg-white border border-slate-200 rounded-xl py-2.5 text-sm font-bold text-slate-700 shadow-sm disabled:opacity-40"
               >
-                {rankImageBusy ? '이미지 만드는 중...' : `📷 ${RANK_TITLES[rankMode]} 이미지로 저장`}
+                {rankImageBusy ? '이미지 만드는 중...' : `📷 시즌 ${viewedSeasonNumber} ${RANK_TITLES[rankMode]} 이미지로 저장`}
               </button>
               <div className="bg-white rounded-2xl shadow-sm divide-y divide-slate-100">
                 {rankingRows.length === 0 && <p className="text-slate-400 text-xs p-4 text-center">등록된 선수가 없어요.</p>}
@@ -5702,7 +6456,7 @@ function BasketballClubApp() {
                   <div className="flex-1 min-w-0">
                     <p className="text-slate-800 font-bold text-base flex items-center gap-1.5 truncate">
                       {me.name}
-                      {me.isAdmin && <span className="text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0">관리자</span>}
+                      {rankOf(me) > 0 && <span className="text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0">{ROLE_LABEL[roleOf(me)]}</span>}
                     </p>
                     <p className="text-slate-400 text-xs font-medium">사번 {me.employeeId}</p>
                   </div>
@@ -5735,7 +6489,7 @@ function BasketballClubApp() {
 
               <div className="bg-white rounded-2xl p-4 shadow-sm flex items-center justify-between">
                 <div>
-                  <p className="text-xs text-slate-400 font-bold">Rating</p>
+                  <p className="text-xs text-slate-400 font-bold">Rating · 시즌 {currentSeason.number}</p>
                   <p className="text-2xl font-black text-slate-800 mt-1">{myGames > 0 ? mySkill : '-'}</p>
                 </div>
                 <div className="text-right">
@@ -5748,15 +6502,15 @@ function BasketballClubApp() {
 
               <div className="grid grid-cols-2 gap-3">
                 <div className="bg-white rounded-2xl p-4 shadow-sm">
-                  <p className="text-xs text-slate-400 font-bold">승률</p>
+                  <p className="text-xs text-slate-400 font-bold">승률 · 시즌 {currentSeason.number}</p>
                   <p className="text-2xl font-black text-slate-800 mt-1">{pct(me.wins || 0, myGames)}</p>
                   <p className="text-xs text-slate-500 font-medium mt-1">{me.wins || 0}승 {me.losses || 0}패</p>
                   <p className="text-xs text-orange-600 font-bold mt-0.5">{myWinRankLabel}</p>
                 </div>
                 <div className="bg-white rounded-2xl p-4 shadow-sm">
-                  <p className="text-xs text-slate-400 font-bold">적중률</p>
+                  <p className="text-xs text-slate-400 font-bold">적중률 · 시즌 {currentSeason.number}</p>
                   <p className="text-2xl font-black text-slate-800 mt-1">{pct(myPred.correct, myPred.total)}</p>
-                  <p className="text-xs text-slate-500 font-medium mt-1">{myPred.total}번 중 {myPred.correct}번 적중</p>
+                  <p className="text-xs text-slate-500 font-medium mt-1">{myPred.total}번 중 {fmtNum(myPred.correct)}점</p>
                   <p className="text-xs text-orange-600 font-bold mt-0.5">{myPredRankLabel}</p>
                 </div>
               </div>
@@ -5782,24 +6536,6 @@ function BasketballClubApp() {
                 )}
               </div>
 
-              {!me.isAdmin && (
-                <div className="bg-white rounded-2xl p-4 shadow-sm">
-                  <button onClick={() => setShowAdminClaim((v) => !v)} className="w-full flex items-center justify-between">
-                    <span className="text-slate-800 font-bold text-sm">관리자 등록</span>
-                    <span className="text-slate-400 text-xs font-medium">{showAdminClaim ? '접기' : '코드 입력'}</span>
-                  </button>
-                  {showAdminClaim && (
-                    <div className="flex gap-2 mt-3">
-                      <input
-                        value={adminCodeInput} onChange={(e) => setAdminCodeInput(e.target.value)} placeholder="관리자 코드"
-                        className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500"
-                      />
-                      <button onClick={handleClaimAdmin} className="bg-orange-600 text-white text-xs font-bold px-3 rounded-lg">확인</button>
-                    </div>
-                  )}
-                </div>
-              )}
-
               {!isStandaloneApp() && (
                 <button onClick={openInstallPrompt} className="w-full bg-white rounded-2xl p-4 shadow-sm flex items-center justify-between">
                   <span className="text-slate-800 font-bold text-sm">📲 앱으로 설치하기</span>
@@ -5817,10 +6553,11 @@ function BasketballClubApp() {
                       let sub;
                       let right;
                       if (h.kind === 'prediction') {
+                        const credit = typeof h.credit === 'number' ? h.credit : (h.predictionCorrect ? 1 : 0);
                         sub = `승부예측 · ${h.predicted}팀 선택`;
                         right = (
-                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${h.predictionCorrect ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
-                            {h.predictionCorrect ? '적중' : '실패'}
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${credit > 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
+                            {credit >= 1 ? '적중' : credit > 0 ? `공동 1위 ${fmtNum(credit)}점` : '실패'}
                           </span>
                         );
                       } else if (h.kind === 'record') {
@@ -5839,8 +6576,14 @@ function BasketballClubApp() {
                           </span>
                         ) : null;
                       }
+                      // 시즌이 바뀌는 곳에 구분선 (시즌 번호가 없는 예전 기록은 시즌 1)
+                      const hs = h.season || 1;
+                      const prev = idx > 0 ? (sortedHistory[idx - 1].season || 1) : null;
+                      const showSeason = pastSeasons.length > 0 && hs !== prev;
                       return (
-                        <div key={idx} className="flex items-center justify-between px-4 py-2.5">
+                        <React.Fragment key={idx}>
+                        {showSeason && <p className="px-4 py-1.5 bg-slate-50 text-xs font-bold text-slate-400">시즌 {hs}{hs === currentSeason.number ? ' (이번 시즌)' : ''}</p>}
+                        <div className="flex items-center justify-between px-4 py-2.5">
                           <div className="min-w-0">
                             <p className="text-sm font-semibold text-slate-700">{formatDateLabel(h.date)}</p>
                             <p className="text-xs text-slate-400 mt-0.5">{sub}</p>
@@ -5852,6 +6595,7 @@ function BasketballClubApp() {
                             )}
                           </div>
                         </div>
+                        </React.Fragment>
                       );
                     })}
                   </div>
@@ -5865,12 +6609,47 @@ function BasketballClubApp() {
             </div>
           )}
 
-          {tab === 'admin' && me.isAdmin && (
+          {tab === 'admin' && can(me, 'closeDay') && (
             <div className="space-y-3">
+              <p className="text-xs text-slate-400 px-1">내 권한: <span className="font-bold text-slate-600">{ROLE_LABEL[roleOf(me)]}</span></p>
+
+              {can(me, 'endSeason') && (
+                <div className="bg-white rounded-2xl p-4 shadow-sm">
+                  <p className="text-slate-800 font-bold text-sm">시즌 관리</p>
+                  <p className="text-slate-500 text-xs mt-1">
+                    지금은 <span className="font-bold text-slate-700">시즌 {currentSeason.number}</span>
+                    {currentSeason.startDate ? ` (${formatDateLabel(currentSeason.startDate)}부터)` : ''}
+                  </p>
+                  {seasonMsg && <p className="text-emerald-600 text-xs font-medium mt-2">{seasonMsg}</p>}
+                  {!confirmingSeasonEnd ? (
+                    <button
+                      onClick={() => { setConfirmingSeasonEnd(true); setSeasonMsg(''); }}
+                      className="w-full mt-3 border border-red-200 text-red-600 rounded-xl py-2.5 text-sm font-bold"
+                    >
+                      시즌 {currentSeason.number} 종료하기
+                    </button>
+                  ) : (
+                    <div className="bg-red-50 rounded-xl p-3 mt-3">
+                      <p className="text-red-700 text-sm font-bold mb-2">시즌 {currentSeason.number}{eulReul(currentSeason.number)} 종료할까요?</p>
+                      <ul className="text-xs text-red-700 space-y-1 mb-3 list-disc pl-4">
+                        <li>이번 시즌 승률, 적중률, Rating 기록은 '지난 시즌'으로 보관돼요.</li>
+                        <li>모든 회원의 승패, 예측 점수가 0으로, Rating이 1500으로 초기화돼요.</li>
+                        <li>마감 안 된 지난 날은 먼저 자동 마감돼요. 오늘 경기가 열려 있으면 먼저 마감해야 해요.</li>
+                        <li>종료 후에는 되돌릴 수 없어요. 혹시 모르니 아래 백업을 먼저 만들어두세요.</li>
+                      </ul>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button onClick={() => setConfirmingSeasonEnd(false)} className="py-2 rounded-lg text-sm font-bold text-slate-500 bg-white">취소</button>
+                        <button onClick={handleEndSeason} disabled={busy} className="py-2 rounded-lg text-sm font-bold text-white bg-red-600 disabled:opacity-50">시즌 종료</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
                 <div className="p-4 pb-3">
                   <p className="text-slate-800 font-bold text-sm">회원 관리 ({Object.keys(players).length}명)</p>
-                  <p className="text-slate-400 text-xs mt-0.5">포지션과 키를 바꾸고 저장을 누르세요.</p>
+                  <p className="text-slate-400 text-xs mt-0.5">포지션, 키, 권한을 바꾸고 저장을 누르세요.</p>
                   <input
                     value={memberSearch} onChange={(e) => setMemberSearch(e.target.value)}
                     placeholder="이름 또는 사번 검색"
@@ -5889,15 +6668,18 @@ function BasketballClubApp() {
                       const draft = memberDrafts[p.id] || {};
                       const posValue = draft.position ?? normalizePosition(p.position);
                       const heightValue = draft.height ?? (p.height ? String(p.height) : '');
+                      const roleValue = draft.role ?? roleOf(p);
+                      const assignable = rolesAssignable(me, p);
                       const changed = (draft.position !== undefined && draft.position !== normalizePosition(p.position))
-                        || (draft.height !== undefined && draft.height !== String(p.height || ''));
+                        || (draft.height !== undefined && draft.height !== String(p.height || ''))
+                        || (draft.role !== undefined && draft.role !== roleOf(p));
                       const games = gamesPlayed(p);
                       return (
                         <div key={p.id} className="px-4 py-3">
                           <div className="flex items-center gap-2">
                             <Avatar name={p.name} size="sm" />
                             <span className="text-sm font-bold text-slate-800 truncate">{p.name}</span>
-                            {p.isAdmin && <span className="text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0">관리자</span>}
+                            {rankOf(p) > 0 && <span className="text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0">{ROLE_LABEL[roleOf(p)]}</span>}
                             {!validHeight(p.height) && <span className="text-xs text-red-500 font-bold bg-red-50 px-1.5 py-0.5 rounded shrink-0">키 미입력</span>}
                           </div>
                           <p className="text-xs text-slate-400 mt-1">
@@ -5925,12 +6707,24 @@ function BasketballClubApp() {
                               저장
                             </button>
                           </div>
+                          {assignable.length > 0 && p.id !== currentPlayerId && (
+                            <div className="flex items-center gap-2 mt-2">
+                              <span className="text-xs text-slate-500 shrink-0">권한</span>
+                              <select
+                                value={roleValue} onChange={(e) => setMemberDraft(p.id, 'role', e.target.value)}
+                                className="flex-1 min-w-0 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-1.5 focus:outline-none"
+                              >
+                                {assignable.map((r) => <option key={r} value={r}>{ROLE_LABEL[r]}</option>)}
+                              </select>
+                            </div>
+                          )}
                         </div>
                       );
                     })}
                 </div>
               </div>
 
+              {can(me, 'backup') && (
               <div className="bg-white rounded-2xl p-4 shadow-sm">
                 <p className="text-slate-800 font-bold text-sm mb-1">데이터 백업 / 복원</p>
                 <p className="text-slate-400 text-xs mb-3 leading-relaxed">
@@ -5979,8 +6773,10 @@ function BasketballClubApp() {
                   )}
                 </div>
               </div>
+              )}
 
               <p className="text-slate-800 font-bold text-sm">📋 업데이트 로그</p>
+              {!can(me, 'undoLogs') && <p className="text-xs text-slate-400 -mt-1">취소, 삭제, 되돌리기는 관리자 이상만 할 수 있어요.</p>}
               <div className="bg-white rounded-2xl shadow-sm divide-y divide-slate-100">
                 {logs.length === 0 && <p className="text-slate-400 text-xs p-4 text-center">아직 기록이 없어요.</p>}
                 {logs.map((log) => (
@@ -5997,7 +6793,14 @@ function BasketballClubApp() {
                           </span>
                         )}
                         {log.type === 'prediction' && (
-                          <span>경기 마감 · {log.void ? '예측 무효 (동률)' : `${log.winners[0]}팀 최다승`}</span>
+                          <span>
+                            {log.auto ? '자동 마감' : '경기 마감'} · {log.void
+                              ? (log.winners && log.winners.length ? '예측 무효 (동률)' : '팀끼리 경기 없음')
+                              : log.winners.length === 1 ? `${log.winners[0]}팀 최다승` : `${log.winners.join('·')}팀 공동 1위`}
+                          </span>
+                        )}
+                        {log.type === 'season-end' && (
+                          <span className="text-red-600">시즌 {log.season} 종료</span>
                         )}
                         {!log.type && (
                           <span className={log.winner === 'A' ? 'text-blue-600' : 'text-orange-600'}>{log.winner}팀 승리 처리</span>
@@ -6005,8 +6808,10 @@ function BasketballClubApp() {
                       </p>
                       <p className="text-xs text-slate-400 mt-0.5">{log.adminName}님 · {formatDateTime(log.timestamp)}</p>
                     </div>
-                    {log.undone ? (
+                    {log.type === 'season-end' ? null : log.undone ? (
                       <span className="text-xs font-bold text-slate-300 shrink-0">{log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨'}</span>
+                    ) : !can(me, 'undoLogs') ? null : (log.season || 1) < currentSeason.number ? (
+                      <span className="text-xs font-bold text-slate-300 shrink-0">지난 시즌</span>
                     ) : log.type === 'record-edit' ? (
                       <button onClick={() => handleRevertEdit(log.id)} disabled={busy} className="text-xs font-bold text-slate-600 shrink-0 border border-slate-200 rounded-full px-2.5 py-1">
                         되돌리기
@@ -6022,6 +6827,26 @@ function BasketballClubApp() {
             </div>
           )}
         </div>
+
+        {toast && (
+          <div className="fixed left-0 right-0 z-50 flex justify-center px-4 pointer-events-none" style={{ bottom: 'calc(5.5rem + env(safe-area-inset-bottom))' }}>
+            <p className="max-w-sm bg-slate-900 text-white text-xs font-bold rounded-xl px-4 py-3 shadow-lg text-center">{toast}</p>
+          </div>
+        )}
+
+        {inviteFallback && (
+          <div className="fixed inset-0 z-50 bg-black/50 flex items-end justify-center px-4" style={{ paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }} onClick={() => setInviteFallback('')}>
+            <div className="w-full max-w-sm bg-white rounded-3xl p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+              <p className="text-slate-900 font-bold text-base mb-2">초대 링크</p>
+              <p className="text-xs text-slate-500 mb-2">자동 복사가 안 되는 환경이에요. 아래 글을 길게 눌러 전체 선택 후 복사해주세요.</p>
+              <textarea
+                readOnly value={inviteFallback} onFocus={(e) => e.target.select()}
+                className="w-full h-28 border border-slate-200 rounded-lg p-2 text-xs text-slate-700 resize-none focus:outline-none"
+              />
+              <button onClick={() => setInviteFallback('')} className="w-full mt-3 bg-slate-100 text-slate-600 rounded-xl py-3 text-sm font-bold">닫기</button>
+            </div>
+          </div>
+        )}
 
         {rankImage && (
           <div className="fixed inset-0 z-50 bg-black/70 flex flex-col" onClick={closeRankImage}>
@@ -6058,9 +6883,9 @@ function BasketballClubApp() {
           <button onClick={() => setTab('mypage')} className={`flex-1 flex flex-col items-center gap-0.5 py-1.5 rounded-xl ${tab === 'mypage' ? 'text-orange-600' : 'text-slate-400'}`}>
             <span className="text-lg leading-none">👤</span><span className="text-xs font-bold">마이</span>
           </button>
-          {me.isAdmin && (
+          {can(me, 'closeDay') && (
             <button onClick={() => setTab('admin')} className={`flex-1 flex flex-col items-center gap-0.5 py-1.5 rounded-xl ${tab === 'admin' ? 'text-orange-600' : 'text-slate-400'}`}>
-              <span className="text-lg leading-none">🛡️</span><span className="text-xs font-bold">관리자</span>
+              <span className="text-lg leading-none">🛡️</span><span className="text-xs font-bold">관리</span>
             </button>
           )}
         </div>
