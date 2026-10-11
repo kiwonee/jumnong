@@ -166,12 +166,34 @@ function roleOf(p) {
         return p.role;
     return (p === null || p === void 0 ? void 0 : p.isAdmin) ? 'owner' : 'member';
 }
+// 삭제된 회원 (목록, 랭킹, 참석에서 빠지지만 지난 경기 기록에는 이름이 남음)
+function isDeleted(p) {
+    return !!(p === null || p === void 0 ? void 0 : p.deleted);
+}
+// 누가 누구를 삭제할 수 있는지: 자기 자신은 불가
+// 최종관리자는 누구나(최종관리자는 최소 한 명 남아야 함), 관리자는 부관리자와 일반회원만
+function canDeleteMember(actor, target) {
+    if (!actor || !target || actor.id === target.id || isDeleted(target))
+        return false;
+    if (!can(actor, 'deleteMembers'))
+        return false;
+    if (roleOf(actor) === 'owner')
+        return true;
+    return rankOf(target) < ROLE_RANK.admin;
+}
+// 관리자가 직접 추가해서 아직 앱에 가입하지 않은 회원
+function isAppless(p) {
+    return !!p && !p.passwordHash;
+}
 function rankOf(p) {
     return ROLE_RANK[roleOf(p)];
 }
 // 권한별로 할 수 있는 일
 const PERM = {
     closeDay: 1, // 경기 마감: 부관리자 이상
+    manageAttendance: 1, // 다른 회원 참석 추가, 빼기 (앱을 안 쓰는 회원용): 부관리자 이상
+    addMembers: 2, // 회원 직접 추가 (앱을 안 쓰는 회원용): 관리자 이상
+    deleteMembers: 2, // 회원 삭제: 관리자 이상
     editMembers: 1, // 회원 포지션, 키 수정: 부관리자 이상
     undoLogs: 2, // 업데이트 로그 취소, 삭제, 되돌리기: 관리자 이상
     endSeason: 2, // 시즌 종료: 관리자 이상
@@ -1015,6 +1037,12 @@ function BasketballClubApp() {
     const [memberDrafts, setMemberDrafts] = useState({}); // 관리자 회원 관리: { 사번: { position, height } }
     const [memberSearch, setMemberSearch] = useState('');
     const [memberMsg, setMemberMsg] = useState('');
+    const [showAttendanceManager, setShowAttendanceManager] = useState(false);
+    const [attendanceSearch, setAttendanceSearch] = useState('');
+    const [newMember, setNewMember] = useState({ name: '', empId: '', position: POSITIONS[2], height: '' });
+    const [addMemberMsg, setAddMemberMsg] = useState('');
+    const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+    const [showDeleted, setShowDeleted] = useState(false);
     const [regPassword, setRegPassword] = useState('');
     const [regPasswordConfirm, setRegPasswordConfirm] = useState('');
     const [teamCountChoice, setTeamCountChoice] = useState(null); // null이면 인원 기준 자동
@@ -1047,6 +1075,14 @@ function BasketballClubApp() {
     const [seasonMsg, setSeasonMsg] = useState('');
     const pendingRef = useRef(0); // 저장 중에는 주기적 새로고침이 화면을 덮어쓰지 않도록
     const autoCloseRef = useRef(async () => { }); // 자동 마감 함수 (아래에서 연결)
+    useEffect(() => {
+        const p = currentPlayerId ? players[currentPlayerId] : null;
+        if (p && isDeleted(p)) {
+            localStorage.removeItem('currentPlayerId');
+            setCurrentPlayerId(null);
+            setError('삭제된 회원이에요. 관리자에게 문의해주세요.');
+        }
+    }, [players, currentPlayerId]);
     const [backupText, setBackupText] = useState('');
     const [backupMsg, setBackupMsg] = useState('');
     const [restoreText, setRestoreText] = useState('');
@@ -1232,16 +1268,66 @@ function BasketballClubApp() {
         setBusy(true);
         try {
             const fresh = parsePlayers((await api.getMany(['players'])).players);
+            const { hash, method } = await hashPassword(regPassword);
+            if (fresh[empId] && isAppless(fresh[empId])) {
+                // 관리자가 미리 추가한 회원: 이름이 같으면 비밀번호만 설정하고 지금까지 기록을 그대로 이어받음
+                if (fresh[empId].name.trim() !== name) {
+                    setError('이미 등록된 사번이에요. 관리자에게 등록된 이름을 확인해주세요.');
+                    return;
+                }
+                const res = await api.batchIf([{ key: 'players', type: 'json', patches: [
+                            { op: 'set', path: [empId, 'passwordHash'], value: hash },
+                            { op: 'set', path: [empId, 'passwordMethod'], value: method },
+                            { op: 'set', path: [empId, 'position'], value: regPosition },
+                            { op: 'set', path: [empId, 'height'], value: height },
+                            { op: 'set', path: [empId, 'joinedAt'], value: new Date().toISOString() },
+                        ] }], ['players'], [{ key: 'players', path: [empId, 'passwordHash'], absent: true }]);
+                applyValues(res.values);
+                if (!res.applied) {
+                    setError('이미 가입된 사번입니다. 로그인해주세요.');
+                    return;
+                }
+                localStorage.setItem('currentPlayerId', empId);
+                setCurrentPlayerId(empId);
+                setRegName('');
+                setRegEmpId('');
+                setRegHeight('');
+                setRegPassword('');
+                setRegPasswordConfirm('');
+                return;
+            }
+            if (fresh[empId] && isDeleted(fresh[empId])) {
+                // 삭제된 회원의 사번으로 가입: 새 회원으로 처음부터 (예전 개인 기록도 비움)
+                const fresh2 = {
+                    id: empId, name, employeeId: empId, passwordHash: hash, passwordMethod: method,
+                    position: regPosition, height, elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0,
+                    predTotal: 0, predCorrect: 0, lastEloDelta: null, lastRecordId: null, role: 'member',
+                    createdAt: new Date().toISOString(),
+                };
+                const res = await api.batchIf([{ key: 'players', type: 'json', patches: [{ op: 'set', path: [empId], value: fresh2 }] }, { key: `history:${empId}`, type: 'set', value: '[]' }], ['players'], [{ key: 'players', path: [empId, 'deleted'], equals: true }]);
+                applyValues(res.values);
+                if (!res.applied) {
+                    setError('이미 등록된 사번입니다. 로그인해주세요.');
+                    return;
+                }
+                localStorage.setItem('currentPlayerId', empId);
+                setCurrentPlayerId(empId);
+                setRegName('');
+                setRegEmpId('');
+                setRegHeight('');
+                setRegPassword('');
+                setRegPasswordConfirm('');
+                return;
+            }
             if (fresh[empId]) {
                 setError('이미 등록된 사번입니다. 로그인해주세요.');
                 return;
             }
-            const { hash, method } = await hashPassword(regPassword);
             const newPlayer = {
                 id: empId, name, employeeId: empId, passwordHash: hash, passwordMethod: method,
                 position: regPosition, height, elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0,
                 predTotal: 0, predCorrect: 0, lastEloDelta: null, lastRecordId: null,
-                role: Object.keys(fresh).length === 0 ? 'owner' : 'member',
+                role: Object.values(fresh).filter((x) => !isDeleted(x)).length === 0 ? 'owner' : 'member',
                 createdAt: new Date().toISOString(),
             };
             // 같은 사번으로 거의 동시에 가입하면 먼저 저장된 사람만 남음
@@ -1280,6 +1366,14 @@ function BasketballClubApp() {
             const player = fresh[empId];
             if (!player) {
                 setError('등록되지 않은 사번입니다. 회원가입을 먼저 해주세요.');
+                return;
+            }
+            if (isDeleted(player)) {
+                setError('삭제된 회원이에요. 관리자에게 문의해주세요.');
+                return;
+            }
+            if (isAppless(player)) {
+                setError('관리자가 추가한 회원이에요. 회원가입에서 같은 사번과 이름으로 가입하면 지금까지 기록이 이어져요.');
                 return;
             }
             const ok = await verifyPassword(loginPassword, player);
@@ -1342,7 +1436,9 @@ function BasketballClubApp() {
     };
     const me = currentPlayerId ? players[currentPlayerId] : null;
     const attendeeIds = Object.keys(daily.attendance || {}).filter((id) => daily.attendance[id]);
-    const attendeePlayers = attendeeIds.map((id) => players[id]).filter(Boolean);
+    const attendeePlayers = attendeeIds.map((id) => players[id]).filter((p) => p && !isDeleted(p));
+    const activePlayers = Object.values(players).filter((p) => !isDeleted(p));
+    const deletedPlayers = Object.values(players).filter(isDeleted);
     const iAttend = currentPlayerId ? !!((_a = daily.attendance) === null || _a === void 0 ? void 0 : _a[currentPlayerId]) : false;
     // 내 기록: 최신 날짜가 위로, 같은 날은 나중에 입력한 기록이 위로
     const sortedHistory = [...(myHistory || (me === null || me === void 0 ? void 0 : me.history) || [])].reverse().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
@@ -1408,38 +1504,41 @@ function BasketballClubApp() {
             setBusy(false);
         }
     };
-    const handleToggleAttendance = async () => {
+    // 참석 바꾸기 (본인 신청/취소, 부관리자 이상의 대리 추가/빼기 공통)
+    // 서버에서는 그 사람 칸만 바꿔서, 동시에 누른 다른 사람의 신청을 덮어쓰지 않음
+    const changeAttendance = async (targetId, joining, { proxy = false } = {}) => {
         var _a, _b;
-        if (!isToday)
-            return;
-        const m = minutesOfDay(new Date());
-        if (dayClosed || m < SIGNUP_OPEN_MIN || m >= SIGNUP_CLOSE_MIN) {
-            setError('참가신청은 오전 5시부터 11시 45분까지만 할 수 있어요.');
-            return;
-        }
         const before = daily;
-        const joining = !((_a = before.attendance) === null || _a === void 0 ? void 0 : _a[currentPlayerId]);
+        const targetName = ((_a = players[targetId]) === null || _a === void 0 ? void 0 : _a.name) || targetId;
         // 누르는 즉시 화면에 반영 (저장은 뒤에서)
         setDaily((d) => {
             const att = { ...(d.attendance || {}) };
+            const by = { ...(d.attendanceBy || {}) };
             if (joining)
-                att[currentPlayerId] = true;
+                att[targetId] = true;
             else
-                delete att[currentPlayerId];
-            return { ...d, attendance: att };
+                delete att[targetId];
+            if (joining && proxy)
+                by[targetId] = myName;
+            else
+                delete by[targetId];
+            return { ...d, attendance: att, attendanceBy: by };
         });
         pendingRef.current += 1;
         try {
-            // 서버에서는 내 칸만 바꿔서, 동시에 누른 다른 사람의 신청을 덮어쓰지 않음
             const fresh = await loadFreshDaily();
             const next = { ...(fresh.attendance || {}) };
             if (joining)
-                next[currentPlayerId] = true;
+                next[targetId] = true;
             else
-                delete next[currentPlayerId];
+                delete next[targetId];
             const patches = [joining
-                    ? { op: 'set', path: ['attendance', currentPlayerId], value: true }
-                    : { op: 'delete', path: ['attendance', currentPlayerId] }];
+                    ? { op: 'set', path: ['attendance', targetId], value: true }
+                    : { op: 'delete', path: ['attendance', targetId] }];
+            // 누가 대신 넣었는지 기록 (본인이 직접 신청하면 지움)
+            patches.push(joining && proxy
+                ? { op: 'set', path: ['attendanceBy', targetId], value: myName }
+                : { op: 'delete', path: ['attendanceBy', targetId] });
             // 예전에 팀을 나눴던 인원 구성으로 돌아가면, 그때 팀과 예측을 그대로 되살림
             if (fresh.teams && !(fresh.records || []).some((r) => r.fromTeams)) {
                 const newIds = Object.keys(next).filter((id) => next[id] && players[id]);
@@ -1453,7 +1552,7 @@ function BasketballClubApp() {
                         teamCache: cache,
                         teamHistory: [...(fresh.teamHistory || []), {
                                 at: new Date().toISOString(), by: myName, size: newIds.length, teamCount: Object.keys(saved.teams).length,
-                                added: joining ? [myName] : [], removed: joining ? [] : [myName], restored: true, auto: true,
+                                added: joining ? [targetName] : [], removed: joining ? [] : [targetName], restored: true, auto: true,
                             }],
                     };
                     Object.entries(restore).forEach(([k, v]) => patches.push({ op: 'set', path: [k], value: v }));
@@ -1464,10 +1563,148 @@ function BasketballClubApp() {
         }
         catch (e) {
             setDaily(before); // 실패하면 원래대로
-            setError(`참가신청 처리 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+            setError(`참석 처리 중 문제가 발생했습니다. (${serverErrorText(e)})`);
         }
         finally {
             pendingRef.current -= 1;
+        }
+    };
+    const handleToggleAttendance = async () => {
+        var _a;
+        if (!isToday)
+            return;
+        const m = minutesOfDay(new Date());
+        if (dayClosed || m < SIGNUP_OPEN_MIN || m >= SIGNUP_CLOSE_MIN) {
+            setError('참가신청은 오전 5시부터 11시 45분까지만 할 수 있어요.');
+            return;
+        }
+        await changeAttendance(currentPlayerId, !((_a = daily.attendance) === null || _a === void 0 ? void 0 : _a[currentPlayerId]));
+    };
+    // 부관리자 이상: 다른 회원 참석 추가, 빼기 (신청 시간과 상관없이 오늘 마감 전까지)
+    const handleProxyAttendance = async (targetId) => {
+        var _a;
+        if (!isToday || dayClosed)
+            return;
+        if (!can(me, 'manageAttendance')) {
+            setError('참석자를 바꿀 권한이 없어요.');
+            return;
+        }
+        setError('');
+        await changeAttendance(targetId, !((_a = daily.attendance) === null || _a === void 0 ? void 0 : _a[targetId]), { proxy: true });
+    };
+    // 관리자 이상: 회원 삭제 (지난 경기 기록과 다른 회원 기록은 그대로, 복구 가능)
+    const handleDeleteMember = async (id) => {
+        setError('');
+        setMemberMsg('');
+        const target = players[id];
+        if (!canDeleteMember(me, target)) {
+            setError('이 회원을 삭제할 권한이 없어요.');
+            return;
+        }
+        setBusy(true);
+        try {
+            const fresh = parsePlayers((await api.getMany(['players'])).players);
+            const t = fresh[id];
+            if (!t || isDeleted(t)) {
+                setConfirmDeleteId(null);
+                return;
+            }
+            if (roleOf(t) === 'owner' && Object.values(fresh).filter((p) => roleOf(p) === 'owner' && !isDeleted(p) && p.id !== id).length < 1) {
+                setError('최종관리자는 최소 한 명 있어야 해요.');
+                return;
+            }
+            const nowIso = new Date().toISOString();
+            const ops = [
+                { key: 'players', type: 'json', patches: [
+                        { op: 'set', path: [id, 'deleted'], value: true },
+                        { op: 'set', path: [id, 'deletedAt'], value: nowIso },
+                        { op: 'set', path: [id, 'deletedBy'], value: myName },
+                    ] },
+                // 오늘 참석에 있었다면 빼기
+                { key: `daily:${dateKey}`, type: 'json', patches: [{ op: 'delete', path: ['attendance', id] }, { op: 'delete', path: ['attendanceBy', id] }] },
+                { key: 'updateLog', type: 'json', init: [], patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: uniqueId('member-delete'), type: 'member-delete', targetId: id, targetName: t.name, date: dateKey, season: currentSeason.number, timestamp: nowIso, adminName: myName, undone: true } }] },
+            ];
+            await write(ops, ['players', `daily:${viewDate}`, ...(tab === 'admin' ? ['updateLog'] : [])]);
+            setConfirmDeleteId(null);
+            setMemberMsg(`${t.name}님을 삭제했어요. 아래 '삭제된 회원'에서 복구할 수 있어요.`);
+        }
+        catch (e) {
+            setError(`회원 삭제 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    const handleRestoreMember = async (id) => {
+        setError('');
+        setMemberMsg('');
+        const target = players[id];
+        if (!target || !can(me, 'deleteMembers') || (roleOf(target) === 'owner' && roleOf(me) !== 'owner')) {
+            setError('이 회원을 복구할 권한이 없어요.');
+            return;
+        }
+        setBusy(true);
+        try {
+            await write([
+                { key: 'players', type: 'json', patches: [{ op: 'delete', path: [id, 'deleted'] }, { op: 'delete', path: [id, 'deletedAt'] }, { op: 'delete', path: [id, 'deletedBy'] }] },
+                { key: 'updateLog', type: 'json', init: [], patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: uniqueId('member-restore'), type: 'member-restore', targetId: id, targetName: target.name, date: dateKey, season: currentSeason.number, timestamp: new Date().toISOString(), adminName: myName, undone: true } }] },
+            ], ['players', ...(tab === 'admin' ? ['updateLog'] : [])]);
+            setMemberMsg(`${target.name}님을 복구했어요.`);
+        }
+        catch (e) {
+            setError(`회원 복구 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    // 관리자 이상: 앱을 안 쓰는 회원 직접 추가
+    const handleAddMember = async () => {
+        setError('');
+        setAddMemberMsg('');
+        if (!can(me, 'addMembers')) {
+            setError('회원을 추가할 권한이 없어요.');
+            return;
+        }
+        const name = newMember.name.trim();
+        const empId = newMember.empId.trim();
+        const height = validHeight(newMember.height);
+        if (!name) {
+            setError('이름을 입력해주세요.');
+            return;
+        }
+        if (height === null) {
+            setError(`키는 ${MIN_HEIGHT}~${MAX_HEIGHT} 사이 숫자(cm)로 입력해주세요.`);
+            return;
+        }
+        setBusy(true);
+        try {
+            const fresh = parsePlayers((await api.getMany(['players'])).players);
+            if (empId && fresh[empId]) {
+                setError('이미 등록된 사번이에요.');
+                return;
+            }
+            const id = empId || uniqueId('m');
+            const member = {
+                id, name, employeeId: empId, position: normalizePosition(newMember.position), height,
+                elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0, predTotal: 0, predCorrect: 0,
+                lastEloDelta: null, lastRecordId: null, role: 'member',
+                addedBy: myName, createdAt: new Date().toISOString(),
+            };
+            const values = await write([{ key: 'players', type: 'json', patches: [{ op: 'setIfMissing', path: [id], value: member }] }], ['players']);
+            const saved = parsePlayers(values.players)[id];
+            if (!saved || saved.createdAt !== member.createdAt) {
+                setError('이미 등록된 사번이에요.');
+                return;
+            }
+            setNewMember({ name: '', empId: '', position: POSITIONS[2], height: '' });
+            setAddMemberMsg(`${name}님을 추가했어요.${empId ? ' 나중에 같은 사번과 이름으로 가입하면 기록이 이어져요.' : ''}`);
+        }
+        catch (e) {
+            setError(`회원 추가 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+        }
+        finally {
+            setBusy(false);
         }
     };
     const handleGenerateTeams = async () => {
@@ -1481,7 +1718,7 @@ function BasketballClubApp() {
                 setError('이미 오늘 팀으로 기록된 경기가 있어서 다시 나눌 수 없어요. 관리자 탭에서 기록을 먼저 취소해주세요.');
                 return;
             }
-            const attendees = Object.keys(fresh.attendance || {}).filter((id) => fresh.attendance[id]).map((id) => players[id]).filter(Boolean);
+            const attendees = Object.keys(fresh.attendance || {}).filter((id) => fresh.attendance[id]).map((id) => players[id]).filter((p) => p && !isDeleted(p));
             // 이미 나눈 팀은 참가인원이 바뀌었을 때만 다시 나눌 수 있음 (방금 다른 사람이 나눴을 수도 있어서 최신 기준으로 확인)
             const freshTeamIds = fresh.teams ? TEAM_LABELS.flatMap((l) => fresh.teams[l] || []) : [];
             if (fresh.teams && sameMembers(attendees.map((p) => p.id), freshTeamIds)) {
@@ -2117,7 +2354,7 @@ function BasketballClubApp() {
             if (update.role && roleOf(players[id]) === 'owner' && update.role !== 'owner') {
                 // 최종관리자는 항상 한 명 이상 남아 있어야 함 (최신 정보로 확인)
                 const fresh = parsePlayers((await api.getMany(['players'])).players);
-                const owners = Object.values(fresh).filter((p) => roleOf(p) === 'owner');
+                const owners = Object.values(fresh).filter((p) => roleOf(p) === 'owner' && !isDeleted(p));
                 if (owners.length <= 1) {
                     setError('최종관리자는 최소 한 명 있어야 해요. 다른 사람을 먼저 최종관리자로 지정해주세요.');
                     return;
@@ -2376,7 +2613,7 @@ function BasketballClubApp() {
     // 이번 시즌이면 지금 회원 기록, 지난 시즌이면 보관된 기록으로 랭킹 계산
     const pastSeasons = [...((seasons === null || seasons === void 0 ? void 0 : seasons.past) || [])].sort((a, b) => b.number - a.number);
     const viewingPast = seasonView !== null && !!seasonSnapshots[seasonView];
-    const rankSource = viewingPast ? (seasonSnapshots[seasonView].players || {}) : players;
+    const rankSource = viewingPast ? (seasonSnapshots[seasonView].players || {}) : Object.fromEntries(activePlayers.map((p) => [p.id, p]));
     const viewedSeasonNumber = viewingPast ? seasonView : currentSeason.number;
     const scoredPlayers = Object.values(rankSource).map((p) => {
         const games = gamesPlayed(p);
@@ -2502,7 +2739,7 @@ function BasketballClubApp() {
     const mySkill = Math.round(eloOf(me));
     // 마이페이지 순위는 랭킹 화면에서 지난 시즌을 보고 있어도 항상 이번 시즌 기준
     const curScored = viewingPast
-        ? Object.values(players).map((p) => {
+        ? activePlayers.map((p) => {
             const games = gamesPlayed(p);
             const pred = predictionStats(p);
             return { ...p, games, pred, winScore: wilsonScore(p.wins || 0, games), predScore: wilsonScore(pred.correct, pred.total), skill: eloOf(p) };
@@ -2617,9 +2854,32 @@ function BasketballClubApp() {
                         React.createElement("p", { className: "text-xs text-slate-400 mt-1 mb-3" },
                             "\uCC38\uAC00\uC2E0\uCCAD \uC624\uC804 5:00 ~ 11:45",
                             iAttend ? ' · 나는 신청 완료' : ''),
-                        attendeePlayers.length > 0 ? (React.createElement("div", { className: "flex flex-wrap gap-2" }, attendeePlayers.map((p) => (React.createElement("div", { key: p.id, className: "flex items-center gap-1 bg-slate-50 rounded-full pl-1 pr-2.5 py-1" },
-                            React.createElement(Avatar, { name: p.name, size: "sm" }),
-                            React.createElement("span", { className: "text-xs font-semibold text-slate-700" }, p.name)))))) : (React.createElement("p", { className: "text-slate-400 text-xs" }, "\uC544\uC9C1 \uC2E0\uCCAD\uD55C \uC0AC\uB78C\uC774 \uC5C6\uC5B4\uC694."))),
+                        attendeePlayers.length > 0 ? (React.createElement("div", { className: "flex flex-wrap gap-2" }, attendeePlayers.map((p) => {
+                            var _a;
+                            return (React.createElement("div", { key: p.id, className: "flex items-center gap-1 bg-slate-50 rounded-full pl-1 pr-2.5 py-1" },
+                                React.createElement(Avatar, { name: p.name, size: "sm" }),
+                                React.createElement("span", { className: "text-xs font-semibold text-slate-700" }, p.name),
+                                ((_a = daily.attendanceBy) === null || _a === void 0 ? void 0 : _a[p.id]) && React.createElement("span", { className: "text-xs text-slate-400" },
+                                    "\u00B7 ",
+                                    daily.attendanceBy[p.id],
+                                    " \uCD94\uAC00")));
+                        }))) : (React.createElement("p", { className: "text-slate-400 text-xs" }, "\uC544\uC9C1 \uC2E0\uCCAD\uD55C \uC0AC\uB78C\uC774 \uC5C6\uC5B4\uC694.")),
+                        isToday && !dayClosed && can(me, 'manageAttendance') && (React.createElement("div", { className: "mt-3 pt-3 border-t border-slate-100" },
+                            React.createElement("button", { onClick: () => { setShowAttendanceManager((v) => !v); setAttendanceSearch(''); }, className: "w-full text-xs font-bold text-slate-600 bg-slate-100 rounded-lg py-2" }, showAttendanceManager ? '참석자 관리 닫기' : '👥 참석자 추가/빼기 (관리)'),
+                            showAttendanceManager && (React.createElement("div", { className: "mt-3" },
+                                React.createElement("p", { className: "text-xs text-slate-500 mb-2" }, "\uC774\uB984\uC744 \uB204\uB974\uBA74 \uCC38\uC11D\uC5D0 \uB123\uAC70\uB098 \uBE60\uC838\uC694. \uC571\uC744 \uC548 \uC4F0\uB294 \uD68C\uC6D0\uB3C4 \uB123\uC744 \uC218 \uC788\uACE0, \uC2E0\uCCAD \uB9C8\uAC10 \uB4A4\uC5D0\uB3C4 \uBC14\uAFC0 \uC218 \uC788\uC5B4\uC694."),
+                                React.createElement("input", { value: attendanceSearch, onChange: (e) => setAttendanceSearch(e.target.value), placeholder: "\uC774\uB984 \uAC80\uC0C9", className: "w-full mb-2 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" }),
+                                React.createElement("div", { className: "flex flex-wrap gap-1.5" }, activePlayers
+                                    .filter((p) => !attendanceSearch.trim() || (p.name || '').includes(attendanceSearch.trim()))
+                                    .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ko'))
+                                    .map((p) => {
+                                    var _a;
+                                    const on = !!((_a = daily.attendance) === null || _a === void 0 ? void 0 : _a[p.id]);
+                                    return (React.createElement("button", { key: p.id, onClick: () => handleProxyAttendance(p.id), className: `text-xs font-bold rounded-full px-2.5 py-1.5 border ${on ? 'bg-orange-600 text-white border-orange-600' : 'border-slate-200 text-slate-500'}` },
+                                        on ? '✓ ' : '',
+                                        p.name,
+                                        isAppless(p) ? ' (앱 미가입)' : ''));
+                                }))))))),
                     isToday && !dayClosed && (React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
                         React.createElement("div", { className: "flex items-center justify-between mb-3" },
                             React.createElement("p", { className: "text-slate-800 font-bold text-sm" }, "\uD300 \uB098\uB204\uAE30"),
@@ -2787,7 +3047,7 @@ function BasketballClubApp() {
                             const mode = canUseTeams ? recMode : 'custom';
                             const nameA = mode === 'teams' && activePair ? `${activePair[0]}팀` : '팀1';
                             const nameB = mode === 'teams' && activePair ? `${activePair[1]}팀` : '팀2';
-                            const pickerPlayers = Object.values(players)
+                            const pickerPlayers = activePlayers
                                 .filter((p) => { var _a; return recShowAll || ((_a = daily.attendance) === null || _a === void 0 ? void 0 : _a[p.id]) || recAssign[p.id]; })
                                 .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ko'));
                             const count1 = Object.values(recAssign).filter((v) => v === 1).length;
@@ -3083,16 +3343,31 @@ function BasketballClubApp() {
                             React.createElement("div", { className: "grid grid-cols-2 gap-2" },
                                 React.createElement("button", { onClick: () => setConfirmingSeasonEnd(false), className: "py-2 rounded-lg text-sm font-bold text-slate-500 bg-white" }, "\uCDE8\uC18C"),
                                 React.createElement("button", { onClick: handleEndSeason, disabled: busy, className: "py-2 rounded-lg text-sm font-bold text-white bg-red-600 disabled:opacity-50" }, "\uC2DC\uC98C \uC885\uB8CC")))))),
+                    can(me, 'addMembers') && (React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
+                        React.createElement("p", { className: "text-slate-800 font-bold text-sm" }, "\uD68C\uC6D0 \uCD94\uAC00"),
+                        React.createElement("p", { className: "text-slate-400 text-xs mt-0.5" }, "\uC571\uC744 \uC548 \uC4F0\uB294 \uD68C\uC6D0\uC744 \uC9C1\uC811 \uCD94\uAC00\uD574\uC694. \uD300 \uB098\uB204\uAE30, \uACBD\uAE30 \uAE30\uB85D, \uB7AD\uD0B9\uC5D0 \uB611\uAC19\uC774 \uB4E4\uC5B4\uAC00\uC694."),
+                        React.createElement("div", { className: "space-y-2 mt-3" },
+                            React.createElement("input", { value: newMember.name, onChange: (e) => setNewMember((m) => ({ ...m, name: e.target.value })), placeholder: "\uC774\uB984", className: "w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" }),
+                            React.createElement("input", { value: newMember.empId, onChange: (e) => setNewMember((m) => ({ ...m, empId: e.target.value })), placeholder: "\uC0AC\uBC88 (\uC120\uD0DD: \uB123\uC5B4\uB450\uBA74 \uB098\uC911\uC5D0 \uBCF8\uC778\uC774 \uAC00\uC785\uD560 \uB54C \uAE30\uB85D\uC774 \uC774\uC5B4\uC838\uC694)", className: "w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" }),
+                            React.createElement("div", { className: "flex gap-2" },
+                                React.createElement("select", { value: newMember.position, onChange: (e) => setNewMember((m) => ({ ...m, position: e.target.value })), className: "flex-1 min-w-0 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-2 focus:outline-none" }, POSITIONS.map((pos) => React.createElement("option", { key: pos, value: pos },
+                                    pos,
+                                    " (",
+                                    POSITION_ABBR[pos],
+                                    ")"))),
+                                React.createElement("input", { value: newMember.height, onChange: (e) => setNewMember((m) => ({ ...m, height: e.target.value.replace(/[^0-9]/g, '') })), inputMode: "numeric", placeholder: "\uD0A4 (cm)", className: "w-24 border border-slate-200 rounded-lg px-3 py-2 text-sm text-right focus:outline-none focus:ring-2 focus:ring-orange-500" })),
+                            React.createElement("button", { onClick: handleAddMember, disabled: busy, className: "w-full bg-slate-900 text-white rounded-lg py-2.5 text-sm font-bold disabled:opacity-60" }, "\uD68C\uC6D0 \uCD94\uAC00"),
+                            addMemberMsg && React.createElement("p", { className: "text-emerald-600 text-xs font-medium" }, addMemberMsg)))),
                     React.createElement("div", { className: "bg-white rounded-2xl shadow-sm overflow-hidden" },
                         React.createElement("div", { className: "p-4 pb-3" },
                             React.createElement("p", { className: "text-slate-800 font-bold text-sm" },
                                 "\uD68C\uC6D0 \uAD00\uB9AC (",
-                                Object.keys(players).length,
+                                activePlayers.length,
                                 "\uBA85)"),
                             React.createElement("p", { className: "text-slate-400 text-xs mt-0.5" }, "\uD3EC\uC9C0\uC158, \uD0A4, \uAD8C\uD55C\uC744 \uBC14\uAFB8\uACE0 \uC800\uC7A5\uC744 \uB204\uB974\uC138\uC694."),
                             React.createElement("input", { value: memberSearch, onChange: (e) => setMemberSearch(e.target.value), placeholder: "\uC774\uB984 \uB610\uB294 \uC0AC\uBC88 \uAC80\uC0C9", className: "w-full mt-3 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500" }),
                             memberMsg && React.createElement("p", { className: "text-emerald-600 text-xs font-medium mt-2" }, memberMsg)),
-                        React.createElement("div", { className: "divide-y divide-slate-100 border-t border-slate-100" }, Object.values(players)
+                        React.createElement("div", { className: "divide-y divide-slate-100 border-t border-slate-100" }, activePlayers
                             .filter((p) => {
                             const q = memberSearch.trim();
                             return !q || (p.name || '').includes(q) || String(p.employeeId || '').includes(q);
@@ -3114,14 +3389,16 @@ function BasketballClubApp() {
                                     React.createElement(Avatar, { name: p.name, size: "sm" }),
                                     React.createElement("span", { className: "text-sm font-bold text-slate-800 truncate" }, p.name),
                                     rankOf(p) > 0 && React.createElement("span", { className: "text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0" }, ROLE_LABEL[roleOf(p)]),
-                                    !validHeight(p.height) && React.createElement("span", { className: "text-xs text-red-500 font-bold bg-red-50 px-1.5 py-0.5 rounded shrink-0" }, "\uD0A4 \uBBF8\uC785\uB825")),
+                                    !validHeight(p.height) && React.createElement("span", { className: "text-xs text-red-500 font-bold bg-red-50 px-1.5 py-0.5 rounded shrink-0" }, "\uD0A4 \uBBF8\uC785\uB825"),
+                                    isAppless(p) && React.createElement("span", { className: "text-xs text-slate-500 font-bold bg-slate-100 px-1.5 py-0.5 rounded shrink-0" }, "\uC571 \uBBF8\uAC00\uC785")),
                                 React.createElement("p", { className: "text-xs text-slate-400 mt-1" },
                                     "\uC0AC\uBC88 ",
-                                    p.employeeId,
+                                    p.employeeId || '없음',
                                     " \u00B7 ",
                                     games,
                                     "\uACBD\uAE30 \u00B7 Rating ",
-                                    games > 0 ? Math.round(eloOf(p)) : '-'),
+                                    games > 0 ? Math.round(eloOf(p)) : '-',
+                                    p.addedBy ? ` · ${p.addedBy} 추가` : ''),
                                 React.createElement("div", { className: "flex items-center gap-2 mt-2" },
                                     React.createElement("select", { value: posValue, onChange: (e) => setMemberDraft(p.id, 'position', e.target.value), className: "flex-1 min-w-0 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-1.5 focus:outline-none" }, POSITIONS.map((pos) => React.createElement("option", { key: pos, value: pos },
                                         pos,
@@ -3131,10 +3408,31 @@ function BasketballClubApp() {
                                     React.createElement("input", { value: heightValue, onChange: (e) => setMemberDraft(p.id, 'height', e.target.value.replace(/[^0-9]/g, '')), inputMode: "numeric", placeholder: "\uD0A4", className: "w-16 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-1.5 text-right focus:outline-none focus:ring-2 focus:ring-orange-500" }),
                                     React.createElement("span", { className: "text-xs text-slate-500" }, "cm"),
                                     React.createElement("button", { onClick: () => handleAdminSaveMember(p.id), disabled: busy || !changed, className: "text-xs font-bold text-white bg-orange-600 rounded-lg px-2.5 py-1.5 disabled:opacity-30" }, "\uC800\uC7A5")),
+                                canDeleteMember(me, p) && (confirmDeleteId === p.id ? (React.createElement("div", { className: "bg-red-50 rounded-lg p-2.5 mt-2" },
+                                    React.createElement("p", { className: "text-xs text-red-700 font-bold" },
+                                        p.name,
+                                        "\uB2D8\uC744 \uC0AD\uC81C\uD560\uAE4C\uC694?"),
+                                    React.createElement("p", { className: "text-xs text-red-600 mt-0.5" }, "\uD68C\uC6D0 \uBAA9\uB85D, \uB7AD\uD0B9, \uCC38\uC11D\uC5D0\uC11C \uBE60\uC9C0\uACE0 \uB85C\uADF8\uC778\uD560 \uC218 \uC5C6\uAC8C \uB3FC\uC694. \uC9C0\uB09C \uACBD\uAE30 \uAE30\uB85D\uACFC \uB2E4\uB978 \uD68C\uC6D0\uC758 \uAE30\uB85D\uC740 \uADF8\uB300\uB85C \uB0A8\uACE0, \uB098\uC911\uC5D0 \uBCF5\uAD6C\uD560 \uC218 \uC788\uC5B4\uC694."),
+                                    React.createElement("div", { className: "grid grid-cols-2 gap-2 mt-2" },
+                                        React.createElement("button", { onClick: () => setConfirmDeleteId(null), className: "py-1.5 rounded-lg text-xs font-bold text-slate-500 bg-white" }, "\uCDE8\uC18C"),
+                                        React.createElement("button", { onClick: () => handleDeleteMember(p.id), disabled: busy, className: "py-1.5 rounded-lg text-xs font-bold text-white bg-red-600 disabled:opacity-50" }, "\uC0AD\uC81C")))) : (React.createElement("button", { onClick: () => setConfirmDeleteId(p.id), className: "text-xs font-bold text-red-500 mt-2" }, "\uD68C\uC6D0 \uC0AD\uC81C"))),
                                 assignable.length > 0 && p.id !== currentPlayerId && (React.createElement("div", { className: "flex items-center gap-2 mt-2" },
                                     React.createElement("span", { className: "text-xs text-slate-500 shrink-0" }, "\uAD8C\uD55C"),
                                     React.createElement("select", { value: roleValue, onChange: (e) => setMemberDraft(p.id, 'role', e.target.value), className: "flex-1 min-w-0 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-1.5 focus:outline-none" }, assignable.map((r) => React.createElement("option", { key: r, value: r }, ROLE_LABEL[r])))))));
-                        }))),
+                        })),
+                        can(me, 'deleteMembers') && deletedPlayers.length > 0 && (React.createElement("div", { className: "border-t border-slate-100" },
+                            React.createElement("button", { onClick: () => setShowDeleted((v) => !v), className: "w-full px-4 py-3 text-left text-xs font-bold text-slate-400" },
+                                "\uC0AD\uC81C\uB41C \uD68C\uC6D0 ",
+                                deletedPlayers.length,
+                                "\uBA85 ",
+                                showDeleted ? '접기' : '보기'),
+                            showDeleted && deletedPlayers.map((p) => (React.createElement("div", { key: p.id, className: "flex items-center justify-between px-4 py-2.5 border-t border-slate-50" },
+                                React.createElement("div", { className: "min-w-0" },
+                                    React.createElement("p", { className: "text-sm font-bold text-slate-400 truncate" }, p.name),
+                                    React.createElement("p", { className: "text-xs text-slate-400" },
+                                        p.deletedBy ? `${p.deletedBy} 삭제` : '삭제됨',
+                                        p.deletedAt ? ` · ${formatDateTime(p.deletedAt)}` : '')),
+                                !(roleOf(p) === 'owner' && roleOf(me) !== 'owner') && (React.createElement("button", { onClick: () => handleRestoreMember(p.id), disabled: busy, className: "text-xs font-bold text-slate-600 border border-slate-200 rounded-full px-2.5 py-1 shrink-0" }, "\uBCF5\uAD6C")))))))),
                     can(me, 'backup') && (React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
                         React.createElement("p", { className: "text-slate-800 font-bold text-sm mb-1" }, "\uB370\uC774\uD130 \uBC31\uC5C5 / \uBCF5\uC6D0"),
                         React.createElement("p", { className: "text-slate-400 text-xs mb-3 leading-relaxed" }, "\uC774\uC81C \uB370\uC774\uD130\uB294 \uAD6C\uAE00\uC2DC\uD2B8\uC5D0 \uC788\uC5B4\uC11C \uCF54\uB4DC\uB97C \uC218\uC815\uD574\uB3C4 \uC0AC\uB77C\uC9C0\uC9C0 \uC54A\uC544\uC694. \uC774 \uAE30\uB2A5\uC740 \uB9CC\uC57D\uC744 \uC704\uD55C \uC5EC\uBD84\uC758 \uBC31\uC5C5\uC6A9\uC774\uC5D0\uC694."),
@@ -3201,6 +3499,12 @@ function BasketballClubApp() {
                                         "\uC2DC\uC98C ",
                                         log.season,
                                         " \uC885\uB8CC")),
+                                    log.type === 'member-delete' && React.createElement("span", { className: "text-red-600" },
+                                        log.targetName,
+                                        " \uD68C\uC6D0 \uC0AD\uC81C"),
+                                    log.type === 'member-restore' && React.createElement("span", null,
+                                        log.targetName,
+                                        " \uD68C\uC6D0 \uBCF5\uAD6C"),
                                     !log.type && (React.createElement("span", { className: log.winner === 'A' ? 'text-blue-600' : 'text-orange-600' },
                                         log.winner,
                                         "\uD300 \uC2B9\uB9AC \uCC98\uB9AC"))),
@@ -3208,7 +3512,7 @@ function BasketballClubApp() {
                                     log.adminName,
                                     "\uB2D8 \u00B7 ",
                                     formatDateTime(log.timestamp))),
-                            log.type === 'season-end' ? null : log.undone ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨')) : !can(me, 'undoLogs') ? null : (log.season || 1) < currentSeason.number ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, "\uC9C0\uB09C \uC2DC\uC98C")) : log.type === 'record-edit' ? (React.createElement("button", { onClick: () => handleRevertEdit(log.id), disabled: busy, className: "text-xs font-bold text-slate-600 shrink-0 border border-slate-200 rounded-full px-2.5 py-1" }, "\uB418\uB3CC\uB9AC\uAE30")) : (React.createElement("button", { onClick: () => handleUndo(log.id), disabled: busy, className: "text-xs font-bold text-red-500 shrink-0 border border-red-200 rounded-full px-2.5 py-1" }, log.type === 'record' ? '삭제' : '취소'))))))))),
+                            ['season-end', 'member-delete', 'member-restore'].includes(log.type) ? null : log.undone ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨')) : !can(me, 'undoLogs') ? null : (log.season || 1) < currentSeason.number ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, "\uC9C0\uB09C \uC2DC\uC98C")) : log.type === 'record-edit' ? (React.createElement("button", { onClick: () => handleRevertEdit(log.id), disabled: busy, className: "text-xs font-bold text-slate-600 shrink-0 border border-slate-200 rounded-full px-2.5 py-1" }, "\uB418\uB3CC\uB9AC\uAE30")) : (React.createElement("button", { onClick: () => handleUndo(log.id), disabled: busy, className: "text-xs font-bold text-red-500 shrink-0 border border-red-200 rounded-full px-2.5 py-1" }, log.type === 'record' ? '삭제' : '취소'))))))))),
             toast && (React.createElement("div", { className: "fixed left-0 right-0 z-50 flex justify-center px-4 pointer-events-none", style: { bottom: 'calc(5.5rem + env(safe-area-inset-bottom))' } },
                 React.createElement("p", { className: "max-w-sm bg-slate-900 text-white text-xs font-bold rounded-xl px-4 py-3 shadow-lg text-center" }, toast))),
             inviteFallback && (React.createElement("div", { className: "fixed inset-0 z-50 bg-black/50 flex items-end justify-center px-4", style: { paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }, onClick: () => setInviteFallback('') },
@@ -3557,12 +3861,32 @@ function roleOf(p) {
   if (p && ROLES.includes(p.role)) return p.role;
   return p?.isAdmin ? 'owner' : 'member';
 }
+// 삭제된 회원 (목록, 랭킹, 참석에서 빠지지만 지난 경기 기록에는 이름이 남음)
+function isDeleted(p) {
+  return !!p?.deleted;
+}
+// 누가 누구를 삭제할 수 있는지: 자기 자신은 불가
+// 최종관리자는 누구나(최종관리자는 최소 한 명 남아야 함), 관리자는 부관리자와 일반회원만
+function canDeleteMember(actor, target) {
+  if (!actor || !target || actor.id === target.id || isDeleted(target)) return false;
+  if (!can(actor, 'deleteMembers')) return false;
+  if (roleOf(actor) === 'owner') return true;
+  return rankOf(target) < ROLE_RANK.admin;
+}
+
+// 관리자가 직접 추가해서 아직 앱에 가입하지 않은 회원
+function isAppless(p) {
+  return !!p && !p.passwordHash;
+}
 function rankOf(p) {
   return ROLE_RANK[roleOf(p)];
 }
 // 권한별로 할 수 있는 일
 const PERM = {
   closeDay: 1,       // 경기 마감: 부관리자 이상
+  manageAttendance: 1, // 다른 회원 참석 추가, 빼기 (앱을 안 쓰는 회원용): 부관리자 이상
+  addMembers: 2,     // 회원 직접 추가 (앱을 안 쓰는 회원용): 관리자 이상
+  deleteMembers: 2,  // 회원 삭제: 관리자 이상
   editMembers: 1,    // 회원 포지션, 키 수정: 부관리자 이상
   undoLogs: 2,       // 업데이트 로그 취소, 삭제, 되돌리기: 관리자 이상
   endSeason: 2,      // 시즌 종료: 관리자 이상
@@ -4394,6 +4718,12 @@ function BasketballClubApp() {
   const [memberDrafts, setMemberDrafts] = useState({}); // 관리자 회원 관리: { 사번: { position, height } }
   const [memberSearch, setMemberSearch] = useState('');
   const [memberMsg, setMemberMsg] = useState('');
+  const [showAttendanceManager, setShowAttendanceManager] = useState(false);
+  const [attendanceSearch, setAttendanceSearch] = useState('');
+  const [newMember, setNewMember] = useState({ name: '', empId: '', position: POSITIONS[2], height: '' });
+  const [addMemberMsg, setAddMemberMsg] = useState('');
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [showDeleted, setShowDeleted] = useState(false);
   const [regPassword, setRegPassword] = useState('');
   const [regPasswordConfirm, setRegPasswordConfirm] = useState('');
 
@@ -4428,6 +4758,14 @@ function BasketballClubApp() {
   const [seasonMsg, setSeasonMsg] = useState('');
   const pendingRef = useRef(0); // 저장 중에는 주기적 새로고침이 화면을 덮어쓰지 않도록
   const autoCloseRef = useRef(async () => {}); // 자동 마감 함수 (아래에서 연결)
+  useEffect(() => {
+    const p = currentPlayerId ? players[currentPlayerId] : null;
+    if (p && isDeleted(p)) {
+      localStorage.removeItem('currentPlayerId');
+      setCurrentPlayerId(null);
+      setError('삭제된 회원이에요. 관리자에게 문의해주세요.');
+    }
+  }, [players, currentPlayerId]);
 
   const [backupText, setBackupText] = useState('');
   const [backupMsg, setBackupMsg] = useState('');
@@ -4588,13 +4926,54 @@ function BasketballClubApp() {
     setBusy(true);
     try {
       const fresh = parsePlayers((await api.getMany(['players'])).players);
-      if (fresh[empId]) { setError('이미 등록된 사번입니다. 로그인해주세요.'); return; }
       const { hash, method } = await hashPassword(regPassword);
+      if (fresh[empId] && isAppless(fresh[empId])) {
+        // 관리자가 미리 추가한 회원: 이름이 같으면 비밀번호만 설정하고 지금까지 기록을 그대로 이어받음
+        if (fresh[empId].name.trim() !== name) { setError('이미 등록된 사번이에요. 관리자에게 등록된 이름을 확인해주세요.'); return; }
+        const res = await api.batchIf(
+          [{ key: 'players', type: 'json', patches: [
+            { op: 'set', path: [empId, 'passwordHash'], value: hash },
+            { op: 'set', path: [empId, 'passwordMethod'], value: method },
+            { op: 'set', path: [empId, 'position'], value: regPosition },
+            { op: 'set', path: [empId, 'height'], value: height },
+            { op: 'set', path: [empId, 'joinedAt'], value: new Date().toISOString() },
+          ] }],
+          ['players'],
+          [{ key: 'players', path: [empId, 'passwordHash'], absent: true }],
+        );
+        applyValues(res.values);
+        if (!res.applied) { setError('이미 가입된 사번입니다. 로그인해주세요.'); return; }
+        localStorage.setItem('currentPlayerId', empId);
+        setCurrentPlayerId(empId);
+        setRegName(''); setRegEmpId(''); setRegHeight(''); setRegPassword(''); setRegPasswordConfirm('');
+        return;
+      }
+      if (fresh[empId] && isDeleted(fresh[empId])) {
+        // 삭제된 회원의 사번으로 가입: 새 회원으로 처음부터 (예전 개인 기록도 비움)
+        const fresh2 = {
+          id: empId, name, employeeId: empId, passwordHash: hash, passwordMethod: method,
+          position: regPosition, height, elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0,
+          predTotal: 0, predCorrect: 0, lastEloDelta: null, lastRecordId: null, role: 'member',
+          createdAt: new Date().toISOString(),
+        };
+        const res = await api.batchIf(
+          [{ key: 'players', type: 'json', patches: [{ op: 'set', path: [empId], value: fresh2 }] }, { key: `history:${empId}`, type: 'set', value: '[]' }],
+          ['players'],
+          [{ key: 'players', path: [empId, 'deleted'], equals: true }],
+        );
+        applyValues(res.values);
+        if (!res.applied) { setError('이미 등록된 사번입니다. 로그인해주세요.'); return; }
+        localStorage.setItem('currentPlayerId', empId);
+        setCurrentPlayerId(empId);
+        setRegName(''); setRegEmpId(''); setRegHeight(''); setRegPassword(''); setRegPasswordConfirm('');
+        return;
+      }
+      if (fresh[empId]) { setError('이미 등록된 사번입니다. 로그인해주세요.'); return; }
       const newPlayer = {
         id: empId, name, employeeId: empId, passwordHash: hash, passwordMethod: method,
         position: regPosition, height, elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0,
         predTotal: 0, predCorrect: 0, lastEloDelta: null, lastRecordId: null,
-        role: Object.keys(fresh).length === 0 ? 'owner' : 'member',
+        role: Object.values(fresh).filter((x) => !isDeleted(x)).length === 0 ? 'owner' : 'member',
         createdAt: new Date().toISOString(),
       };
       // 같은 사번으로 거의 동시에 가입하면 먼저 저장된 사람만 남음
@@ -4621,6 +5000,8 @@ function BasketballClubApp() {
       setPlayers(fresh);
       const player = fresh[empId];
       if (!player) { setError('등록되지 않은 사번입니다. 회원가입을 먼저 해주세요.'); return; }
+      if (isDeleted(player)) { setError('삭제된 회원이에요. 관리자에게 문의해주세요.'); return; }
+      if (isAppless(player)) { setError('관리자가 추가한 회원이에요. 회원가입에서 같은 사번과 이름으로 가입하면 지금까지 기록이 이어져요.'); return; }
       const ok = await verifyPassword(loginPassword, player);
       if (!ok) { setError('비밀번호가 일치하지 않습니다.'); return; }
       localStorage.setItem('currentPlayerId', empId);
@@ -4676,7 +5057,9 @@ function BasketballClubApp() {
   const me = currentPlayerId ? players[currentPlayerId] : null;
 
   const attendeeIds = Object.keys(daily.attendance || {}).filter((id) => daily.attendance[id]);
-  const attendeePlayers = attendeeIds.map((id) => players[id]).filter(Boolean);
+  const attendeePlayers = attendeeIds.map((id) => players[id]).filter((p) => p && !isDeleted(p));
+  const activePlayers = Object.values(players).filter((p) => !isDeleted(p));
+  const deletedPlayers = Object.values(players).filter(isDeleted);
   const iAttend = currentPlayerId ? !!daily.attendance?.[currentPlayerId] : false;
 
   // 내 기록: 최신 날짜가 위로, 같은 날은 나중에 입력한 기록이 위로
@@ -4744,30 +5127,31 @@ function BasketballClubApp() {
     }
   };
 
-  const handleToggleAttendance = async () => {
-    if (!isToday) return;
-    const m = minutesOfDay(new Date());
-    if (dayClosed || m < SIGNUP_OPEN_MIN || m >= SIGNUP_CLOSE_MIN) {
-      setError('참가신청은 오전 5시부터 11시 45분까지만 할 수 있어요.');
-      return;
-    }
+  // 참석 바꾸기 (본인 신청/취소, 부관리자 이상의 대리 추가/빼기 공통)
+  // 서버에서는 그 사람 칸만 바꿔서, 동시에 누른 다른 사람의 신청을 덮어쓰지 않음
+  const changeAttendance = async (targetId, joining, { proxy = false } = {}) => {
     const before = daily;
-    const joining = !before.attendance?.[currentPlayerId];
+    const targetName = players[targetId]?.name || targetId;
     // 누르는 즉시 화면에 반영 (저장은 뒤에서)
     setDaily((d) => {
       const att = { ...(d.attendance || {}) };
-      if (joining) att[currentPlayerId] = true; else delete att[currentPlayerId];
-      return { ...d, attendance: att };
+      const by = { ...(d.attendanceBy || {}) };
+      if (joining) att[targetId] = true; else delete att[targetId];
+      if (joining && proxy) by[targetId] = myName; else delete by[targetId];
+      return { ...d, attendance: att, attendanceBy: by };
     });
     pendingRef.current += 1;
     try {
-      // 서버에서는 내 칸만 바꿔서, 동시에 누른 다른 사람의 신청을 덮어쓰지 않음
       const fresh = await loadFreshDaily();
       const next = { ...(fresh.attendance || {}) };
-      if (joining) next[currentPlayerId] = true; else delete next[currentPlayerId];
+      if (joining) next[targetId] = true; else delete next[targetId];
       const patches = [joining
-        ? { op: 'set', path: ['attendance', currentPlayerId], value: true }
-        : { op: 'delete', path: ['attendance', currentPlayerId] }];
+        ? { op: 'set', path: ['attendance', targetId], value: true }
+        : { op: 'delete', path: ['attendance', targetId] }];
+      // 누가 대신 넣었는지 기록 (본인이 직접 신청하면 지움)
+      patches.push(joining && proxy
+        ? { op: 'set', path: ['attendanceBy', targetId], value: myName }
+        : { op: 'delete', path: ['attendanceBy', targetId] });
 
       // 예전에 팀을 나눴던 인원 구성으로 돌아가면, 그때 팀과 예측을 그대로 되살림
       if (fresh.teams && !(fresh.records || []).some((r) => r.fromTeams)) {
@@ -4782,7 +5166,7 @@ function BasketballClubApp() {
             teamCache: cache,
             teamHistory: [...(fresh.teamHistory || []), {
               at: new Date().toISOString(), by: myName, size: newIds.length, teamCount: Object.keys(saved.teams).length,
-              added: joining ? [myName] : [], removed: joining ? [] : [myName], restored: true, auto: true,
+              added: joining ? [targetName] : [], removed: joining ? [] : [targetName], restored: true, auto: true,
             }],
           };
           Object.entries(restore).forEach(([k, v]) => patches.push({ op: 'set', path: [k], value: v }));
@@ -4792,9 +5176,115 @@ function BasketballClubApp() {
       applyValues(values);
     } catch (e) {
       setDaily(before); // 실패하면 원래대로
-      setError(`참가신청 처리 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+      setError(`참석 처리 중 문제가 발생했습니다. (${serverErrorText(e)})`);
     } finally {
       pendingRef.current -= 1;
+    }
+  };
+
+  const handleToggleAttendance = async () => {
+    if (!isToday) return;
+    const m = minutesOfDay(new Date());
+    if (dayClosed || m < SIGNUP_OPEN_MIN || m >= SIGNUP_CLOSE_MIN) {
+      setError('참가신청은 오전 5시부터 11시 45분까지만 할 수 있어요.');
+      return;
+    }
+    await changeAttendance(currentPlayerId, !daily.attendance?.[currentPlayerId]);
+  };
+
+  // 부관리자 이상: 다른 회원 참석 추가, 빼기 (신청 시간과 상관없이 오늘 마감 전까지)
+  const handleProxyAttendance = async (targetId) => {
+    if (!isToday || dayClosed) return;
+    if (!can(me, 'manageAttendance')) { setError('참석자를 바꿀 권한이 없어요.'); return; }
+    setError('');
+    await changeAttendance(targetId, !daily.attendance?.[targetId], { proxy: true });
+  };
+
+  // 관리자 이상: 회원 삭제 (지난 경기 기록과 다른 회원 기록은 그대로, 복구 가능)
+  const handleDeleteMember = async (id) => {
+    setError('');
+    setMemberMsg('');
+    const target = players[id];
+    if (!canDeleteMember(me, target)) { setError('이 회원을 삭제할 권한이 없어요.'); return; }
+    setBusy(true);
+    try {
+      const fresh = parsePlayers((await api.getMany(['players'])).players);
+      const t = fresh[id];
+      if (!t || isDeleted(t)) { setConfirmDeleteId(null); return; }
+      if (roleOf(t) === 'owner' && Object.values(fresh).filter((p) => roleOf(p) === 'owner' && !isDeleted(p) && p.id !== id).length < 1) {
+        setError('최종관리자는 최소 한 명 있어야 해요.');
+        return;
+      }
+      const nowIso = new Date().toISOString();
+      const ops = [
+        { key: 'players', type: 'json', patches: [
+          { op: 'set', path: [id, 'deleted'], value: true },
+          { op: 'set', path: [id, 'deletedAt'], value: nowIso },
+          { op: 'set', path: [id, 'deletedBy'], value: myName },
+        ] },
+        // 오늘 참석에 있었다면 빼기
+        { key: `daily:${dateKey}`, type: 'json', patches: [{ op: 'delete', path: ['attendance', id] }, { op: 'delete', path: ['attendanceBy', id] }] },
+        { key: 'updateLog', type: 'json', init: [], patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: uniqueId('member-delete'), type: 'member-delete', targetId: id, targetName: t.name, date: dateKey, season: currentSeason.number, timestamp: nowIso, adminName: myName, undone: true } }] },
+      ];
+      await write(ops, ['players', `daily:${viewDate}`, ...(tab === 'admin' ? ['updateLog'] : [])]);
+      setConfirmDeleteId(null);
+      setMemberMsg(`${t.name}님을 삭제했어요. 아래 '삭제된 회원'에서 복구할 수 있어요.`);
+    } catch (e) {
+      setError(`회원 삭제 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRestoreMember = async (id) => {
+    setError('');
+    setMemberMsg('');
+    const target = players[id];
+    if (!target || !can(me, 'deleteMembers') || (roleOf(target) === 'owner' && roleOf(me) !== 'owner')) { setError('이 회원을 복구할 권한이 없어요.'); return; }
+    setBusy(true);
+    try {
+      await write([
+        { key: 'players', type: 'json', patches: [{ op: 'delete', path: [id, 'deleted'] }, { op: 'delete', path: [id, 'deletedAt'] }, { op: 'delete', path: [id, 'deletedBy'] }] },
+        { key: 'updateLog', type: 'json', init: [], patches: [{ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: uniqueId('member-restore'), type: 'member-restore', targetId: id, targetName: target.name, date: dateKey, season: currentSeason.number, timestamp: new Date().toISOString(), adminName: myName, undone: true } }] },
+      ], ['players', ...(tab === 'admin' ? ['updateLog'] : [])]);
+      setMemberMsg(`${target.name}님을 복구했어요.`);
+    } catch (e) {
+      setError(`회원 복구 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 관리자 이상: 앱을 안 쓰는 회원 직접 추가
+  const handleAddMember = async () => {
+    setError('');
+    setAddMemberMsg('');
+    if (!can(me, 'addMembers')) { setError('회원을 추가할 권한이 없어요.'); return; }
+    const name = newMember.name.trim();
+    const empId = newMember.empId.trim();
+    const height = validHeight(newMember.height);
+    if (!name) { setError('이름을 입력해주세요.'); return; }
+    if (height === null) { setError(`키는 ${MIN_HEIGHT}~${MAX_HEIGHT} 사이 숫자(cm)로 입력해주세요.`); return; }
+    setBusy(true);
+    try {
+      const fresh = parsePlayers((await api.getMany(['players'])).players);
+      if (empId && fresh[empId]) { setError('이미 등록된 사번이에요.'); return; }
+      const id = empId || uniqueId('m');
+      const member = {
+        id, name, employeeId: empId, position: normalizePosition(newMember.position), height,
+        elo: ELO_BASE, wins: 0, losses: 0, predictionScore: 0, predTotal: 0, predCorrect: 0,
+        lastEloDelta: null, lastRecordId: null, role: 'member',
+        addedBy: myName, createdAt: new Date().toISOString(),
+      };
+      const values = await write([{ key: 'players', type: 'json', patches: [{ op: 'setIfMissing', path: [id], value: member }] }], ['players']);
+      const saved = parsePlayers(values.players)[id];
+      if (!saved || saved.createdAt !== member.createdAt) { setError('이미 등록된 사번이에요.'); return; }
+      setNewMember({ name: '', empId: '', position: POSITIONS[2], height: '' });
+      setAddMemberMsg(`${name}님을 추가했어요.${empId ? ' 나중에 같은 사번과 이름으로 가입하면 기록이 이어져요.' : ''}`);
+    } catch (e) {
+      setError(`회원 추가 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -4808,7 +5298,7 @@ function BasketballClubApp() {
         setError('이미 오늘 팀으로 기록된 경기가 있어서 다시 나눌 수 없어요. 관리자 탭에서 기록을 먼저 취소해주세요.');
         return;
       }
-      const attendees = Object.keys(fresh.attendance || {}).filter((id) => fresh.attendance[id]).map((id) => players[id]).filter(Boolean);
+      const attendees = Object.keys(fresh.attendance || {}).filter((id) => fresh.attendance[id]).map((id) => players[id]).filter((p) => p && !isDeleted(p));
       // 이미 나눈 팀은 참가인원이 바뀌었을 때만 다시 나눌 수 있음 (방금 다른 사람이 나눴을 수도 있어서 최신 기준으로 확인)
       const freshTeamIds = fresh.teams ? TEAM_LABELS.flatMap((l) => fresh.teams[l] || []) : [];
       if (fresh.teams && sameMembers(attendees.map((p) => p.id), freshTeamIds)) {
@@ -5359,7 +5849,7 @@ function BasketballClubApp() {
       if (update.role && roleOf(players[id]) === 'owner' && update.role !== 'owner') {
         // 최종관리자는 항상 한 명 이상 남아 있어야 함 (최신 정보로 확인)
         const fresh = parsePlayers((await api.getMany(['players'])).players);
-        const owners = Object.values(fresh).filter((p) => roleOf(p) === 'owner');
+        const owners = Object.values(fresh).filter((p) => roleOf(p) === 'owner' && !isDeleted(p));
         if (owners.length <= 1) { setError('최종관리자는 최소 한 명 있어야 해요. 다른 사람을 먼저 최종관리자로 지정해주세요.'); return; }
       }
       await patchPlayer(id, update);
@@ -5586,7 +6076,7 @@ function BasketballClubApp() {
   // 이번 시즌이면 지금 회원 기록, 지난 시즌이면 보관된 기록으로 랭킹 계산
   const pastSeasons = [...(seasons?.past || [])].sort((a, b) => b.number - a.number);
   const viewingPast = seasonView !== null && !!seasonSnapshots[seasonView];
-  const rankSource = viewingPast ? (seasonSnapshots[seasonView].players || {}) : players;
+  const rankSource = viewingPast ? (seasonSnapshots[seasonView].players || {}) : Object.fromEntries(activePlayers.map((p) => [p.id, p]));
   const viewedSeasonNumber = viewingPast ? seasonView : currentSeason.number;
   const scoredPlayers = Object.values(rankSource).map((p) => {
     const games = gamesPlayed(p);
@@ -5712,7 +6202,7 @@ function BasketballClubApp() {
   const mySkill = Math.round(eloOf(me));
   // 마이페이지 순위는 랭킹 화면에서 지난 시즌을 보고 있어도 항상 이번 시즌 기준
   const curScored = viewingPast
-    ? Object.values(players).map((p) => {
+    ? activePlayers.map((p) => {
       const games = gamesPlayed(p);
       const pred = predictionStats(p);
       return { ...p, games, pred, winScore: wilsonScore(p.wins || 0, games), predScore: wilsonScore(pred.correct, pred.total), skill: eloOf(p) };
@@ -5947,11 +6437,51 @@ function BasketballClubApp() {
                       <div key={p.id} className="flex items-center gap-1 bg-slate-50 rounded-full pl-1 pr-2.5 py-1">
                         <Avatar name={p.name} size="sm" />
                         <span className="text-xs font-semibold text-slate-700">{p.name}</span>
+                        {daily.attendanceBy?.[p.id] && <span className="text-xs text-slate-400">· {daily.attendanceBy[p.id]} 추가</span>}
                       </div>
                     ))}
                   </div>
                 ) : (
                   <p className="text-slate-400 text-xs">아직 신청한 사람이 없어요.</p>
+                )}
+
+                {/* 부관리자 이상: 앱을 안 쓰는 회원도 참석 처리 */}
+                {isToday && !dayClosed && can(me, 'manageAttendance') && (
+                  <div className="mt-3 pt-3 border-t border-slate-100">
+                    <button
+                      onClick={() => { setShowAttendanceManager((v) => !v); setAttendanceSearch(''); }}
+                      className="w-full text-xs font-bold text-slate-600 bg-slate-100 rounded-lg py-2"
+                    >
+                      {showAttendanceManager ? '참석자 관리 닫기' : '👥 참석자 추가/빼기 (관리)'}
+                    </button>
+                    {showAttendanceManager && (
+                      <div className="mt-3">
+                        <p className="text-xs text-slate-500 mb-2">이름을 누르면 참석에 넣거나 빠져요. 앱을 안 쓰는 회원도 넣을 수 있고, 신청 마감 뒤에도 바꿀 수 있어요.</p>
+                        <input
+                          value={attendanceSearch} onChange={(e) => setAttendanceSearch(e.target.value)}
+                          placeholder="이름 검색"
+                          className="w-full mb-2 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500"
+                        />
+                        <div className="flex flex-wrap gap-1.5">
+                          {activePlayers
+                            .filter((p) => !attendanceSearch.trim() || (p.name || '').includes(attendanceSearch.trim()))
+                            .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ko'))
+                            .map((p) => {
+                              const on = !!daily.attendance?.[p.id];
+                              return (
+                                <button
+                                  key={p.id}
+                                  onClick={() => handleProxyAttendance(p.id)}
+                                  className={`text-xs font-bold rounded-full px-2.5 py-1.5 border ${on ? 'bg-orange-600 text-white border-orange-600' : 'border-slate-200 text-slate-500'}`}
+                                >
+                                  {on ? '✓ ' : ''}{p.name}{isAppless(p) ? ' (앱 미가입)' : ''}
+                                </button>
+                              );
+                            })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
 
@@ -6198,7 +6728,7 @@ function BasketballClubApp() {
                     const mode = canUseTeams ? recMode : 'custom';
                     const nameA = mode === 'teams' && activePair ? `${activePair[0]}팀` : '팀1';
                     const nameB = mode === 'teams' && activePair ? `${activePair[1]}팀` : '팀2';
-                    const pickerPlayers = Object.values(players)
+                    const pickerPlayers = activePlayers
                       .filter((p) => recShowAll || daily.attendance?.[p.id] || recAssign[p.id])
                       .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ko'));
                     const count1 = Object.values(recAssign).filter((v) => v === 1).length;
@@ -6646,9 +7176,42 @@ function BasketballClubApp() {
                 </div>
               )}
 
+              {can(me, 'addMembers') && (
+                <div className="bg-white rounded-2xl p-4 shadow-sm">
+                  <p className="text-slate-800 font-bold text-sm">회원 추가</p>
+                  <p className="text-slate-400 text-xs mt-0.5">앱을 안 쓰는 회원을 직접 추가해요. 팀 나누기, 경기 기록, 랭킹에 똑같이 들어가요.</p>
+                  <div className="space-y-2 mt-3">
+                    <input
+                      value={newMember.name} onChange={(e) => setNewMember((m) => ({ ...m, name: e.target.value }))}
+                      placeholder="이름" className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                    <input
+                      value={newMember.empId} onChange={(e) => setNewMember((m) => ({ ...m, empId: e.target.value }))}
+                      placeholder="사번 (선택: 넣어두면 나중에 본인이 가입할 때 기록이 이어져요)"
+                      className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                    <div className="flex gap-2">
+                      <select
+                        value={newMember.position} onChange={(e) => setNewMember((m) => ({ ...m, position: e.target.value }))}
+                        className="flex-1 min-w-0 text-sm font-bold text-slate-800 bg-slate-50 rounded-lg px-2 py-2 focus:outline-none"
+                      >
+                        {POSITIONS.map((pos) => <option key={pos} value={pos}>{pos} ({POSITION_ABBR[pos]})</option>)}
+                      </select>
+                      <input
+                        value={newMember.height} onChange={(e) => setNewMember((m) => ({ ...m, height: e.target.value.replace(/[^0-9]/g, '') }))}
+                        inputMode="numeric" placeholder="키 (cm)"
+                        className="w-24 border border-slate-200 rounded-lg px-3 py-2 text-sm text-right focus:outline-none focus:ring-2 focus:ring-orange-500"
+                      />
+                    </div>
+                    <button onClick={handleAddMember} disabled={busy} className="w-full bg-slate-900 text-white rounded-lg py-2.5 text-sm font-bold disabled:opacity-60">회원 추가</button>
+                    {addMemberMsg && <p className="text-emerald-600 text-xs font-medium">{addMemberMsg}</p>}
+                  </div>
+                </div>
+              )}
+
               <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
                 <div className="p-4 pb-3">
-                  <p className="text-slate-800 font-bold text-sm">회원 관리 ({Object.keys(players).length}명)</p>
+                  <p className="text-slate-800 font-bold text-sm">회원 관리 ({activePlayers.length}명)</p>
                   <p className="text-slate-400 text-xs mt-0.5">포지션, 키, 권한을 바꾸고 저장을 누르세요.</p>
                   <input
                     value={memberSearch} onChange={(e) => setMemberSearch(e.target.value)}
@@ -6658,7 +7221,7 @@ function BasketballClubApp() {
                   {memberMsg && <p className="text-emerald-600 text-xs font-medium mt-2">{memberMsg}</p>}
                 </div>
                 <div className="divide-y divide-slate-100 border-t border-slate-100">
-                  {Object.values(players)
+                  {activePlayers
                     .filter((p) => {
                       const q = memberSearch.trim();
                       return !q || (p.name || '').includes(q) || String(p.employeeId || '').includes(q);
@@ -6681,9 +7244,10 @@ function BasketballClubApp() {
                             <span className="text-sm font-bold text-slate-800 truncate">{p.name}</span>
                             {rankOf(p) > 0 && <span className="text-xs text-orange-600 font-bold bg-orange-50 px-1.5 py-0.5 rounded shrink-0">{ROLE_LABEL[roleOf(p)]}</span>}
                             {!validHeight(p.height) && <span className="text-xs text-red-500 font-bold bg-red-50 px-1.5 py-0.5 rounded shrink-0">키 미입력</span>}
+                            {isAppless(p) && <span className="text-xs text-slate-500 font-bold bg-slate-100 px-1.5 py-0.5 rounded shrink-0">앱 미가입</span>}
                           </div>
                           <p className="text-xs text-slate-400 mt-1">
-                            사번 {p.employeeId} · {games}경기 · Rating {games > 0 ? Math.round(eloOf(p)) : '-'}
+                            사번 {p.employeeId || '없음'} · {games}경기 · Rating {games > 0 ? Math.round(eloOf(p)) : '-'}{p.addedBy ? ` · ${p.addedBy} 추가` : ''}
                           </p>
                           <div className="flex items-center gap-2 mt-2">
                             <select
@@ -6707,6 +7271,18 @@ function BasketballClubApp() {
                               저장
                             </button>
                           </div>
+                          {canDeleteMember(me, p) && (confirmDeleteId === p.id ? (
+                            <div className="bg-red-50 rounded-lg p-2.5 mt-2">
+                              <p className="text-xs text-red-700 font-bold">{p.name}님을 삭제할까요?</p>
+                              <p className="text-xs text-red-600 mt-0.5">회원 목록, 랭킹, 참석에서 빠지고 로그인할 수 없게 돼요. 지난 경기 기록과 다른 회원의 기록은 그대로 남고, 나중에 복구할 수 있어요.</p>
+                              <div className="grid grid-cols-2 gap-2 mt-2">
+                                <button onClick={() => setConfirmDeleteId(null)} className="py-1.5 rounded-lg text-xs font-bold text-slate-500 bg-white">취소</button>
+                                <button onClick={() => handleDeleteMember(p.id)} disabled={busy} className="py-1.5 rounded-lg text-xs font-bold text-white bg-red-600 disabled:opacity-50">삭제</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <button onClick={() => setConfirmDeleteId(p.id)} className="text-xs font-bold text-red-500 mt-2">회원 삭제</button>
+                          ))}
                           {assignable.length > 0 && p.id !== currentPlayerId && (
                             <div className="flex items-center gap-2 mt-2">
                               <span className="text-xs text-slate-500 shrink-0">권한</span>
@@ -6722,6 +7298,24 @@ function BasketballClubApp() {
                       );
                     })}
                 </div>
+                {can(me, 'deleteMembers') && deletedPlayers.length > 0 && (
+                  <div className="border-t border-slate-100">
+                    <button onClick={() => setShowDeleted((v) => !v)} className="w-full px-4 py-3 text-left text-xs font-bold text-slate-400">
+                      삭제된 회원 {deletedPlayers.length}명 {showDeleted ? '접기' : '보기'}
+                    </button>
+                    {showDeleted && deletedPlayers.map((p) => (
+                      <div key={p.id} className="flex items-center justify-between px-4 py-2.5 border-t border-slate-50">
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold text-slate-400 truncate">{p.name}</p>
+                          <p className="text-xs text-slate-400">{p.deletedBy ? `${p.deletedBy} 삭제` : '삭제됨'}{p.deletedAt ? ` · ${formatDateTime(p.deletedAt)}` : ''}</p>
+                        </div>
+                        {!(roleOf(p) === 'owner' && roleOf(me) !== 'owner') && (
+                          <button onClick={() => handleRestoreMember(p.id)} disabled={busy} className="text-xs font-bold text-slate-600 border border-slate-200 rounded-full px-2.5 py-1 shrink-0">복구</button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {can(me, 'backup') && (
@@ -6802,13 +7396,15 @@ function BasketballClubApp() {
                         {log.type === 'season-end' && (
                           <span className="text-red-600">시즌 {log.season} 종료</span>
                         )}
+                        {log.type === 'member-delete' && <span className="text-red-600">{log.targetName} 회원 삭제</span>}
+                        {log.type === 'member-restore' && <span>{log.targetName} 회원 복구</span>}
                         {!log.type && (
                           <span className={log.winner === 'A' ? 'text-blue-600' : 'text-orange-600'}>{log.winner}팀 승리 처리</span>
                         )}
                       </p>
                       <p className="text-xs text-slate-400 mt-0.5">{log.adminName}님 · {formatDateTime(log.timestamp)}</p>
                     </div>
-                    {log.type === 'season-end' ? null : log.undone ? (
+                    {['season-end', 'member-delete', 'member-restore'].includes(log.type) ? null : log.undone ? (
                       <span className="text-xs font-bold text-slate-300 shrink-0">{log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨'}</span>
                     ) : !can(me, 'undoLogs') ? null : (log.season || 1) < currentSeason.number ? (
                       <span className="text-xs font-bold text-slate-300 shrink-0">지난 시즌</span>
