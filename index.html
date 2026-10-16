@@ -1138,11 +1138,13 @@ function BasketballClubApp() {
     const [seasonSnapshots, setSeasonSnapshots] = useState({});
     const [confirmingSeasonEnd, setConfirmingSeasonEnd] = useState(false);
     const [seasonMsg, setSeasonMsg] = useState('');
+    const [recalcMsg, setRecalcMsg] = useState('');
     const [schedule, setSchedule] = useState(null); // { weekdays: [...], exceptions: { 날짜: { type, reason, by, at } } }
     const [newException, setNewException] = useState({ date: '', type: 'off', reason: '' });
     const [scheduleMsg, setScheduleMsg] = useState('');
     const pendingRef = useRef(0); // 저장 중에는 주기적 새로고침이 화면을 덮어쓰지 않도록
     const autoCloseRef = useRef(async () => { }); // 자동 마감 함수 (아래에서 연결)
+    const recalcRef = useRef(async () => { }); // 예측 점수 배당 재계산 (아래에서 연결)
     useEffect(() => {
         const p = currentPlayerId ? players[currentPlayerId] : null;
         if (p && isDeleted(p)) {
@@ -1232,9 +1234,11 @@ function BasketballClubApp() {
             return;
         }
         (async () => {
+            var _a;
             setLoading(true);
             try {
-                const values = await api.getMany(['players', `daily:${dateKey}`, `editLock:${dateKey}`, 'seasons', 'schedule']);
+                const values = await api.getMany(['players', `daily:${dateKey}`, `editLock:${dateKey}`, 'seasons', 'schedule', 'meta']);
+                const needRecalc = !((_a = parseJson(values.meta, {})) === null || _a === void 0 ? void 0 : _a.oddsRecalcDone);
                 setSchedule(parseJson(values.schedule, null));
                 let p = parsePlayers(values.players);
                 p = await ensureMigrated(p).catch(() => p);
@@ -1246,7 +1250,11 @@ function BasketballClubApp() {
                 if (savedId && p[savedId])
                     setCurrentPlayerId(savedId);
                 // 관리자가 마감하지 않은 지난 날은 자동으로 마감 (화면은 먼저 보여주고 뒤에서 처리)
-                setTimeout(() => { autoCloseRef.current().catch(() => { }); }, 0);
+                // 이어서, 배당 도입 전에 마감된 이번 시즌 예측을 배당 기준으로 한 번만 다시 계산
+                setTimeout(() => {
+                    autoCloseRef.current({ oncePerDay: true }).catch(() => { })
+                        .then(() => (needRecalc ? recalcRef.current({ auto: true }) : null)).catch(() => { });
+                }, 0);
             }
             catch (e) {
                 console.error(e);
@@ -2337,9 +2345,18 @@ function BasketballClubApp() {
     // ----- 자동 마감: 마감하지 않은 지난 날(최근 2주, 이번 시즌)을 찾아서 마감 -----
     // 오늘 팀끼리 경기 기록이 있는 지난 날만 마감해요. 단, 오늘 그날 기록을 입력하거나 고친 사람이 있으면
     // (지난 경기 사후입력 중) 하루 더 기다렸다가 마감해요. force면 기다리지 않고 마감 (시즌 종료 때)
-    const autoCloseOpenDays = async ({ force = false } = {}) => {
+    const autoCloseOpenDays = async ({ force = false, oncePerDay = false } = {}) => {
         if (!API_URL || API_URL.indexOf('PASTE_YOUR') === 0)
             return 0;
+        // 앱을 열 때는 이 휴대폰에서 하루 한 번만 확인 (같은 날 다시 열면 추가 요청 없음)
+        if (oncePerDay) {
+            try {
+                if (localStorage.getItem('autoCloseCheckedDate') === dateKey)
+                    return 0;
+                localStorage.setItem('autoCloseCheckedDate', dateKey);
+            }
+            catch (e) { /* 저장이 막힌 환경이면 그냥 확인 */ }
+        }
         const dates = [];
         for (let i = 1; i <= 14; i++)
             dates.push(shiftDate(dateKey, -i));
@@ -2369,6 +2386,128 @@ function BasketballClubApp() {
         return closed;
     };
     autoCloseRef.current = autoCloseOpenDays;
+    // ----- 예측 점수 배당 재계산 -----
+    // 배당 기능이 생기기 전에 마감된 이번 시즌의 날들을, 그날 투표 수로 배당을 계산해서 다시 매겨요.
+    // 그때 받은 적중 점수와의 차이만큼만 더하고, 다시 계산한 날에는 표시를 남겨서 두 번 계산되지 않아요.
+    // 개인 기록과 마감 로그의 점수도 함께 고쳐서, 나중에 그날 마감을 취소해도 정확히 되돌아가요.
+    const recalcOddsPoints = async ({ auto = false } = {}) => {
+        if (!API_URL || API_URL.indexOf('PASTE_YOUR') === 0)
+            return null;
+        const head = await api.getMany(['seasons', 'meta', 'players', 'updateLog']);
+        const meta = parseJson(head.meta, {}) || {};
+        if (auto && meta.oddsRecalcDone)
+            return null;
+        const season = currentSeasonOf(parseJson(head.seasons, null));
+        const startAt = season.startAt ? new Date(season.startAt).getTime() : null;
+        const keys = (await api.list('daily:')).filter((k) => k.slice('daily:'.length) <= dateKey);
+        const dvals = keys.length ? await api.getMany(keys) : {};
+        const freshPlayers = parsePlayers(head.players);
+        const freshLogs = parseJson(head.updateLog, []);
+        const delta = {};
+        const histPatches = {};
+        const logPatches = [];
+        const ops = [];
+        const requires = [];
+        let days = 0;
+        keys.forEach((k) => {
+            const date = k.slice('daily:'.length);
+            const day = parseJson(dvals[k], null);
+            if (!day)
+                return;
+            const pr = day.predictionResult;
+            const legacy = day.result;
+            let winners;
+            let ts;
+            let field;
+            let predictionId = null;
+            if ((pr === null || pr === void 0 ? void 0 : pr.finalized) && !pr.void && !pr.odds) {
+                winners = pr.winners || [];
+                ts = pr.timestamp;
+                field = 'predictionResult';
+                predictionId = pr.predictionId || null;
+            }
+            else if (!pr && (legacy === null || legacy === void 0 ? void 0 : legacy.finalized) && !legacy.odds) {
+                winners = [legacy.winner];
+                ts = legacy.timestamp;
+                field = 'result';
+            }
+            else
+                return;
+            if (!winners.length)
+                return;
+            if (startAt && (!ts || new Date(ts).getTime() < startAt))
+                return; // 지난 시즌은 그대로
+            const preds = day.predictions || {};
+            const labels = TEAM_LABELS.filter((l) => { var _a, _b; return (_b = (_a = day.teams) === null || _a === void 0 ? void 0 : _a[l]) === null || _b === void 0 ? void 0 : _b.length; });
+            const pointsBy = {};
+            Object.entries(preds).forEach(([pid, pick]) => {
+                const credit = predictionCredit(pick, winners);
+                const points = predictionPoints(pick, winners, preds);
+                const odds = oddsFor(pick, preds);
+                pointsBy[pid] = points;
+                const d = r3(points - credit);
+                if (d)
+                    delta[pid] = r3((delta[pid] || 0) + d);
+                (histPatches[pid] = histPatches[pid] || []).push(predictionId
+                    ? { op: 'updateWhere', match: { predictionId }, set: { points, odds } }
+                    : { op: 'updateWhere', match: { date, kind: null }, set: { points, odds } });
+            });
+            ops.push({ key: k, type: 'json', patches: [{ op: 'set', path: [field, 'odds'], value: Object.fromEntries(labels.map((l) => [l, oddsFor(l, preds)])) }] });
+            requires.push({ key: k, path: [field, 'odds'], absent: true });
+            freshLogs
+                .filter((l) => (predictionId ? l.predictionId === predictionId : (!l.type && l.date === date)))
+                .forEach((l) => {
+                const nd = (l.playerDeltas || []).map((d) => (d.playerId in pointsBy ? { ...d, predPointsDelta: pointsBy[d.playerId] } : d));
+                logPatches.push({ op: 'updateWhere', match: { id: l.id }, set: { playerDeltas: nd } });
+            });
+            days += 1;
+        });
+        const changedIds = Object.keys(delta).filter((id) => freshPlayers[id]);
+        if (changedIds.length) {
+            ops.push({ key: 'players', type: 'json', patches: changedIds.map((id) => ({ op: 'set', path: [id, 'predPoints'], value: r3(predPointsOf(freshPlayers[id]) + delta[id]) })) });
+        }
+        Object.entries(histPatches).forEach(([pid, patches]) => ops.push({ key: `history:${pid}`, type: 'json', init: [], patches }));
+        const nowIso = new Date().toISOString();
+        if (days) {
+            logPatches.push({ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: uniqueId('recalc'), type: 'recalc', text: `이번 시즌 예측 ${days}일치를 배당 기준으로 다시 계산 (${changedIds.length}명 점수 변경)`, date: dateKey, season: season.number, timestamp: nowIso, adminName: auto ? '자동' : myName, undone: true } });
+        }
+        if (logPatches.length)
+            ops.push({ key: 'updateLog', type: 'json', init: [], patches: logPatches });
+        ops.push({ key: 'meta', type: 'json', patches: [{ op: 'set', path: ['oddsRecalcDone'], value: { at: nowIso, by: auto ? '자동' : myName, season: season.number, days } }] });
+        pendingRef.current += 1;
+        try {
+            const res = await api.batchIf(ops, ['players', `daily:${viewDate}`, ...(tab === 'admin' ? ['updateLog'] : [])], requires);
+            applyValues(res.values);
+            return { applied: res.applied, days, changed: changedIds.length };
+        }
+        finally {
+            pendingRef.current -= 1;
+        }
+    };
+    recalcRef.current = recalcOddsPoints;
+    const handleRecalcOdds = async () => {
+        setError('');
+        setRecalcMsg('');
+        if (!can(me, 'undoLogs')) {
+            setError('다시 계산할 권한이 없어요.');
+            return;
+        }
+        setBusy(true);
+        try {
+            const r = await recalcOddsPoints();
+            if (!r)
+                return;
+            setRecalcMsg(!r.applied
+                ? '방금 다른 곳에서 먼저 계산했어요. 다시 눌러 확인해주세요.'
+                : r.days ? `${r.days}일치 예측을 배당 기준으로 다시 계산했어요. (${r.changed}명 점수 변경)` : '다시 계산할 예전 예측이 없어요. 모두 배당 기준이에요.');
+        }
+        catch (e) {
+            setError(`다시 계산 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+        }
+        finally {
+            setBusy(false);
+        }
+    };
     // ----- 업데이트 로그에서 취소/삭제 (읽기 1번 + 저장 1번) -----
     const handleUndo = async (logId) => {
         var _a;
@@ -3604,6 +3743,8 @@ function BasketballClubApp() {
                     })(),
                     can(me, 'endSeason') && (React.createElement("div", { className: "bg-white rounded-2xl p-4 shadow-sm" },
                         React.createElement("p", { className: "text-slate-800 font-bold text-sm" }, "\uC2DC\uC98C \uAD00\uB9AC"),
+                        React.createElement("button", { onClick: handleRecalcOdds, disabled: busy, className: "w-full mt-2 border border-slate-200 text-slate-600 rounded-xl py-2 text-xs font-bold disabled:opacity-50" }, "\uC608\uCE21 \uC810\uC218 \uBC30\uB2F9 \uAE30\uC900\uC73C\uB85C \uB2E4\uC2DC \uACC4\uC0B0"),
+                        recalcMsg && React.createElement("p", { className: "text-emerald-600 text-xs font-medium mt-1.5" }, recalcMsg),
                         React.createElement("p", { className: "text-slate-500 text-xs mt-1" },
                             "\uC9C0\uAE08\uC740 ",
                             React.createElement("span", { className: "font-bold text-slate-700" },
@@ -3798,6 +3939,7 @@ function BasketballClubApp() {
                                     log.type === 'schedule' && React.createElement("span", null,
                                         "\uC77C\uC815 \u00B7 ",
                                         log.text),
+                                    log.type === 'recalc' && React.createElement("span", null, log.text),
                                     log.type === 'member-restore' && React.createElement("span", null,
                                         log.targetName,
                                         " \uD68C\uC6D0 \uBCF5\uAD6C"),
@@ -3808,7 +3950,7 @@ function BasketballClubApp() {
                                     log.adminName,
                                     "\uB2D8 \u00B7 ",
                                     formatDateTime(log.timestamp))),
-                            ['season-end', 'member-delete', 'member-restore', 'schedule'].includes(log.type) ? null : log.undone ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨')) : !can(me, 'undoLogs') ? null : (log.season || 1) < currentSeason.number ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, "\uC9C0\uB09C \uC2DC\uC98C")) : log.type === 'record-edit' ? (React.createElement("button", { onClick: () => handleRevertEdit(log.id), disabled: busy, className: "text-xs font-bold text-slate-600 shrink-0 border border-slate-200 rounded-full px-2.5 py-1" }, "\uB418\uB3CC\uB9AC\uAE30")) : (React.createElement("button", { onClick: () => handleUndo(log.id), disabled: busy, className: "text-xs font-bold text-red-500 shrink-0 border border-red-200 rounded-full px-2.5 py-1" }, log.type === 'record' ? '삭제' : '취소'))))))))),
+                            ['season-end', 'member-delete', 'member-restore', 'schedule', 'recalc'].includes(log.type) ? null : log.undone ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨')) : !can(me, 'undoLogs') ? null : (log.season || 1) < currentSeason.number ? (React.createElement("span", { className: "text-xs font-bold text-slate-300 shrink-0" }, "\uC9C0\uB09C \uC2DC\uC98C")) : log.type === 'record-edit' ? (React.createElement("button", { onClick: () => handleRevertEdit(log.id), disabled: busy, className: "text-xs font-bold text-slate-600 shrink-0 border border-slate-200 rounded-full px-2.5 py-1" }, "\uB418\uB3CC\uB9AC\uAE30")) : (React.createElement("button", { onClick: () => handleUndo(log.id), disabled: busy, className: "text-xs font-bold text-red-500 shrink-0 border border-red-200 rounded-full px-2.5 py-1" }, log.type === 'record' ? '삭제' : '취소'))))))))),
             toast && (React.createElement("div", { className: "fixed left-0 right-0 z-50 flex justify-center px-4 pointer-events-none", style: { bottom: 'calc(5.5rem + env(safe-area-inset-bottom))' } },
                 React.createElement("p", { className: "max-w-sm bg-slate-900 text-white text-xs font-bold rounded-xl px-4 py-3 shadow-lg text-center" }, toast))),
             inviteFallback && (React.createElement("div", { className: "fixed inset-0 z-50 bg-black/50 flex items-end justify-center px-4", style: { paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }, onClick: () => setInviteFallback('') },
@@ -5110,11 +5252,13 @@ function BasketballClubApp() {
   const [seasonSnapshots, setSeasonSnapshots] = useState({});
   const [confirmingSeasonEnd, setConfirmingSeasonEnd] = useState(false);
   const [seasonMsg, setSeasonMsg] = useState('');
+  const [recalcMsg, setRecalcMsg] = useState('');
   const [schedule, setSchedule] = useState(null);       // { weekdays: [...], exceptions: { 날짜: { type, reason, by, at } } }
   const [newException, setNewException] = useState({ date: '', type: 'off', reason: '' });
   const [scheduleMsg, setScheduleMsg] = useState('');
   const pendingRef = useRef(0); // 저장 중에는 주기적 새로고침이 화면을 덮어쓰지 않도록
   const autoCloseRef = useRef(async () => {}); // 자동 마감 함수 (아래에서 연결)
+  const recalcRef = useRef(async () => {});    // 예측 점수 배당 재계산 (아래에서 연결)
   useEffect(() => {
     const p = currentPlayerId ? players[currentPlayerId] : null;
     if (p && isDeleted(p)) {
@@ -5201,7 +5345,8 @@ function BasketballClubApp() {
     (async () => {
       setLoading(true);
       try {
-        const values = await api.getMany(['players', `daily:${dateKey}`, `editLock:${dateKey}`, 'seasons', 'schedule']);
+        const values = await api.getMany(['players', `daily:${dateKey}`, `editLock:${dateKey}`, 'seasons', 'schedule', 'meta']);
+        const needRecalc = !parseJson(values.meta, {})?.oddsRecalcDone;
         setSchedule(parseJson(values.schedule, null));
         let p = parsePlayers(values.players);
         p = await ensureMigrated(p).catch(() => p);
@@ -5212,7 +5357,11 @@ function BasketballClubApp() {
         const savedId = localStorage.getItem('currentPlayerId');
         if (savedId && p[savedId]) setCurrentPlayerId(savedId);
         // 관리자가 마감하지 않은 지난 날은 자동으로 마감 (화면은 먼저 보여주고 뒤에서 처리)
-        setTimeout(() => { autoCloseRef.current().catch(() => {}); }, 0);
+        // 이어서, 배당 도입 전에 마감된 이번 시즌 예측을 배당 기준으로 한 번만 다시 계산
+        setTimeout(() => {
+          autoCloseRef.current({ oncePerDay: true }).catch(() => {})
+            .then(() => (needRecalc ? recalcRef.current({ auto: true }) : null)).catch(() => {});
+        }, 0);
       } catch (e) {
         console.error(e);
         setError(`데이터를 불러오지 못했어요. (${serverErrorText(e)})`);
@@ -6141,8 +6290,15 @@ function BasketballClubApp() {
   // ----- 자동 마감: 마감하지 않은 지난 날(최근 2주, 이번 시즌)을 찾아서 마감 -----
   // 오늘 팀끼리 경기 기록이 있는 지난 날만 마감해요. 단, 오늘 그날 기록을 입력하거나 고친 사람이 있으면
   // (지난 경기 사후입력 중) 하루 더 기다렸다가 마감해요. force면 기다리지 않고 마감 (시즌 종료 때)
-  const autoCloseOpenDays = async ({ force = false } = {}) => {
+  const autoCloseOpenDays = async ({ force = false, oncePerDay = false } = {}) => {
     if (!API_URL || API_URL.indexOf('PASTE_YOUR') === 0) return 0;
+    // 앱을 열 때는 이 휴대폰에서 하루 한 번만 확인 (같은 날 다시 열면 추가 요청 없음)
+    if (oncePerDay) {
+      try {
+        if (localStorage.getItem('autoCloseCheckedDate') === dateKey) return 0;
+        localStorage.setItem('autoCloseCheckedDate', dateKey);
+      } catch (e) { /* 저장이 막힌 환경이면 그냥 확인 */ }
+    }
     const dates = [];
     for (let i = 1; i <= 14; i++) dates.push(shiftDate(dateKey, -i));
     const values = await api.getMany(['seasons', ...dates.map((d) => `daily:${d}`)]);
@@ -6165,6 +6321,108 @@ function BasketballClubApp() {
     return closed;
   };
   autoCloseRef.current = autoCloseOpenDays;
+
+  // ----- 예측 점수 배당 재계산 -----
+  // 배당 기능이 생기기 전에 마감된 이번 시즌의 날들을, 그날 투표 수로 배당을 계산해서 다시 매겨요.
+  // 그때 받은 적중 점수와의 차이만큼만 더하고, 다시 계산한 날에는 표시를 남겨서 두 번 계산되지 않아요.
+  // 개인 기록과 마감 로그의 점수도 함께 고쳐서, 나중에 그날 마감을 취소해도 정확히 되돌아가요.
+  const recalcOddsPoints = async ({ auto = false } = {}) => {
+    if (!API_URL || API_URL.indexOf('PASTE_YOUR') === 0) return null;
+    const head = await api.getMany(['seasons', 'meta', 'players', 'updateLog']);
+    const meta = parseJson(head.meta, {}) || {};
+    if (auto && meta.oddsRecalcDone) return null;
+    const season = currentSeasonOf(parseJson(head.seasons, null));
+    const startAt = season.startAt ? new Date(season.startAt).getTime() : null;
+    const keys = (await api.list('daily:')).filter((k) => k.slice('daily:'.length) <= dateKey);
+    const dvals = keys.length ? await api.getMany(keys) : {};
+    const freshPlayers = parsePlayers(head.players);
+    const freshLogs = parseJson(head.updateLog, []);
+
+    const delta = {};
+    const histPatches = {};
+    const logPatches = [];
+    const ops = [];
+    const requires = [];
+    let days = 0;
+    keys.forEach((k) => {
+      const date = k.slice('daily:'.length);
+      const day = parseJson(dvals[k], null);
+      if (!day) return;
+      const pr = day.predictionResult;
+      const legacy = day.result;
+      let winners;
+      let ts;
+      let field;
+      let predictionId = null;
+      if (pr?.finalized && !pr.void && !pr.odds) { winners = pr.winners || []; ts = pr.timestamp; field = 'predictionResult'; predictionId = pr.predictionId || null; }
+      else if (!pr && legacy?.finalized && !legacy.odds) { winners = [legacy.winner]; ts = legacy.timestamp; field = 'result'; }
+      else return;
+      if (!winners.length) return;
+      if (startAt && (!ts || new Date(ts).getTime() < startAt)) return; // 지난 시즌은 그대로
+      const preds = day.predictions || {};
+      const labels = TEAM_LABELS.filter((l) => day.teams?.[l]?.length);
+      const pointsBy = {};
+      Object.entries(preds).forEach(([pid, pick]) => {
+        const credit = predictionCredit(pick, winners);
+        const points = predictionPoints(pick, winners, preds);
+        const odds = oddsFor(pick, preds);
+        pointsBy[pid] = points;
+        const d = r3(points - credit);
+        if (d) delta[pid] = r3((delta[pid] || 0) + d);
+        (histPatches[pid] = histPatches[pid] || []).push(predictionId
+          ? { op: 'updateWhere', match: { predictionId }, set: { points, odds } }
+          : { op: 'updateWhere', match: { date, kind: null }, set: { points, odds } });
+      });
+      ops.push({ key: k, type: 'json', patches: [{ op: 'set', path: [field, 'odds'], value: Object.fromEntries(labels.map((l) => [l, oddsFor(l, preds)])) }] });
+      requires.push({ key: k, path: [field, 'odds'], absent: true });
+      freshLogs
+        .filter((l) => (predictionId ? l.predictionId === predictionId : (!l.type && l.date === date)))
+        .forEach((l) => {
+          const nd = (l.playerDeltas || []).map((d) => (d.playerId in pointsBy ? { ...d, predPointsDelta: pointsBy[d.playerId] } : d));
+          logPatches.push({ op: 'updateWhere', match: { id: l.id }, set: { playerDeltas: nd } });
+        });
+      days += 1;
+    });
+
+    const changedIds = Object.keys(delta).filter((id) => freshPlayers[id]);
+    if (changedIds.length) {
+      ops.push({ key: 'players', type: 'json', patches: changedIds.map((id) => ({ op: 'set', path: [id, 'predPoints'], value: r3(predPointsOf(freshPlayers[id]) + delta[id]) })) });
+    }
+    Object.entries(histPatches).forEach(([pid, patches]) => ops.push({ key: `history:${pid}`, type: 'json', init: [], patches }));
+    const nowIso = new Date().toISOString();
+    if (days) {
+      logPatches.push({ op: 'upsertById', prepend: true, limit: LOG_LIMIT, value: { id: uniqueId('recalc'), type: 'recalc', text: `이번 시즌 예측 ${days}일치를 배당 기준으로 다시 계산 (${changedIds.length}명 점수 변경)`, date: dateKey, season: season.number, timestamp: nowIso, adminName: auto ? '자동' : myName, undone: true } });
+    }
+    if (logPatches.length) ops.push({ key: 'updateLog', type: 'json', init: [], patches: logPatches });
+    ops.push({ key: 'meta', type: 'json', patches: [{ op: 'set', path: ['oddsRecalcDone'], value: { at: nowIso, by: auto ? '자동' : myName, season: season.number, days } }] });
+    pendingRef.current += 1;
+    try {
+      const res = await api.batchIf(ops, ['players', `daily:${viewDate}`, ...(tab === 'admin' ? ['updateLog'] : [])], requires);
+      applyValues(res.values);
+      return { applied: res.applied, days, changed: changedIds.length };
+    } finally {
+      pendingRef.current -= 1;
+    }
+  };
+  recalcRef.current = recalcOddsPoints;
+
+  const handleRecalcOdds = async () => {
+    setError('');
+    setRecalcMsg('');
+    if (!can(me, 'undoLogs')) { setError('다시 계산할 권한이 없어요.'); return; }
+    setBusy(true);
+    try {
+      const r = await recalcOddsPoints();
+      if (!r) return;
+      setRecalcMsg(!r.applied
+        ? '방금 다른 곳에서 먼저 계산했어요. 다시 눌러 확인해주세요.'
+        : r.days ? `${r.days}일치 예측을 배당 기준으로 다시 계산했어요. (${r.changed}명 점수 변경)` : '다시 계산할 예전 예측이 없어요. 모두 배당 기준이에요.');
+    } catch (e) {
+      setError(`다시 계산 중 문제가 발생했습니다. (${serverErrorText(e)})`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   // ----- 업데이트 로그에서 취소/삭제 (읽기 1번 + 저장 1번) -----
   const handleUndo = async (logId) => {
@@ -7745,6 +8003,10 @@ function BasketballClubApp() {
               {can(me, 'endSeason') && (
                 <div className="bg-white rounded-2xl p-4 shadow-sm">
                   <p className="text-slate-800 font-bold text-sm">시즌 관리</p>
+                  <button onClick={handleRecalcOdds} disabled={busy} className="w-full mt-2 border border-slate-200 text-slate-600 rounded-xl py-2 text-xs font-bold disabled:opacity-50">
+                    예측 점수 배당 기준으로 다시 계산
+                  </button>
+                  {recalcMsg && <p className="text-emerald-600 text-xs font-medium mt-1.5">{recalcMsg}</p>}
                   <p className="text-slate-500 text-xs mt-1">
                     지금은 <span className="font-bold text-slate-700">시즌 {currentSeason.number}</span>
                     {currentSeason.startDate ? ` (${formatDateLabel(currentSeason.startDate)}부터)` : ''}
@@ -8016,6 +8278,7 @@ function BasketballClubApp() {
                         )}
                         {log.type === 'member-delete' && <span className="text-red-600">{log.targetName} 회원 삭제</span>}
                         {log.type === 'schedule' && <span>일정 · {log.text}</span>}
+                        {log.type === 'recalc' && <span>{log.text}</span>}
                         {log.type === 'member-restore' && <span>{log.targetName} 회원 복구</span>}
                         {!log.type && (
                           <span className={log.winner === 'A' ? 'text-blue-600' : 'text-orange-600'}>{log.winner}팀 승리 처리</span>
@@ -8023,7 +8286,7 @@ function BasketballClubApp() {
                       </p>
                       <p className="text-xs text-slate-400 mt-0.5">{log.adminName}님 · {formatDateTime(log.timestamp)}</p>
                     </div>
-                    {['season-end', 'member-delete', 'member-restore', 'schedule'].includes(log.type) ? null : log.undone ? (
+                    {['season-end', 'member-delete', 'member-restore', 'schedule', 'recalc'].includes(log.type) ? null : log.undone ? (
                       <span className="text-xs font-bold text-slate-300 shrink-0">{log.deleted ? '삭제됨' : log.type === 'record-edit' ? '되돌림' : '취소됨'}</span>
                     ) : !can(me, 'undoLogs') ? null : (log.season || 1) < currentSeason.number ? (
                       <span className="text-xs font-bold text-slate-300 shrink-0">지난 시즌</span>
